@@ -373,7 +373,19 @@ func (p *mcpProcessor) postTerminalJSONRPCResponse(
 	allowSyntheticProgress bool,
 ) responsePostResult {
 	p.applyPreFinalStability(ctx, logger, cmd, req, channel, allowSyntheticProgress)
-	return p.postTunnelResponse(ctx, cmd.RequestID(), response)
+	logger.InfoContext(ctx, "dispatcher posting terminal response to control plane",
+		slog.String("channel", channel.String()),
+		slog.String("rpc_method", req.Method))
+	post := p.postTunnelResponse(ctx, cmd.RequestID(), response)
+	if post.err == nil {
+		attrs := []any{
+			slog.String("channel", channel.String()),
+			slog.String("rpc_method", req.Method),
+		}
+		attrs = post.appendTunnelServiceRequestIDAttr(attrs)
+		logger.InfoContext(ctx, "dispatcher terminal response accepted by control plane", attrs...)
+	}
+	return post
 }
 
 func (r responsePostResult) errorAttrs() []any {
@@ -1226,7 +1238,12 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 			return
 		}
 
-		logger.DebugContext(ctx, "dispatcher received response from MCP server", attrsToArgs(jsonRPCResponseCorrelationAttrs(req, response))...)
+		finalAttrs := []any{
+			slog.Int("status_code", responseCode),
+			slog.String("channel", channel.String()),
+		}
+		finalAttrs = append(finalAttrs, attrsToArgs(jsonRPCResponseCorrelationAttrs(req, response))...)
+		logger.InfoContext(ctx, "dispatcher received terminal response from MCP server", finalAttrs...)
 
 		encodedResponse, err := jsonrpc.EncodeMessage(response)
 		if err != nil || len(encodedResponse) == 0 {
