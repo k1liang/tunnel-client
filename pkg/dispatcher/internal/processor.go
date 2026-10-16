@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +33,11 @@ import (
 )
 
 const (
-	defaultAcceptHeaderValue = "application/json, text/event-stream"
+	defaultAcceptHeaderValue                = "application/json, text/event-stream"
+	defaultStabilityPreFinalDelay           = 500 * time.Millisecond
+	defaultStabilityPreFinalNotifyCount     = 2
+	defaultStabilityFinalReserve            = 3 * time.Second
+	defaultStabilityNotificationPostTimeout = 750 * time.Millisecond
 )
 
 var legacyRequiredProcessorChannels = []types.Channel{
@@ -41,6 +47,136 @@ var legacyRequiredProcessorChannels = []types.Channel{
 
 var errResponseDeadlineExceeded = errors.New("tunnel response deadline exceeded")
 var errConnectionTTLExceeded = errors.New("MCP connection TTL exceeded")
+
+func stabilityPreFinalEnabled() bool {
+	value, ok := os.LookupEnv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY")
+	if !ok {
+		return false
+	}
+	enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+	return err == nil && enabled
+}
+
+func stabilityPreFinalDelay() time.Duration {
+	value := strings.TrimSpace(os.Getenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS"))
+	if value == "" {
+		return defaultStabilityPreFinalDelay
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		return defaultStabilityPreFinalDelay
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func stabilityPreFinalNotifyCount() int {
+	value := strings.TrimSpace(os.Getenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT"))
+	if value == "" {
+		return defaultStabilityPreFinalNotifyCount
+	}
+	count, err := strconv.Atoi(value)
+	if err != nil || count < 0 {
+		return defaultStabilityPreFinalNotifyCount
+	}
+	if count > 8 {
+		return 8
+	}
+	return count
+}
+
+func stabilityFallbackLogNotifyEnabled() bool {
+	value, ok := os.LookupEnv("TUNNEL_STABILITY_FALLBACK_LOG_NOTIFY")
+	if !ok {
+		return false
+	}
+	enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+	return err == nil && enabled
+}
+
+func stabilityFinalReserve() time.Duration {
+	value := strings.TrimSpace(os.Getenv("TUNNEL_STABILITY_FINAL_RESERVE_MS"))
+	if value == "" {
+		return defaultStabilityFinalReserve
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		return defaultStabilityFinalReserve
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func stabilityNotificationPostTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("TUNNEL_STABILITY_NOTIFICATION_POST_TIMEOUT_MS"))
+	if value == "" {
+		return defaultStabilityNotificationPostTimeout
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		return defaultStabilityNotificationPostTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func stabilityWindow(ctx context.Context, desired time.Duration) time.Duration {
+	if desired <= 0 {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return desired
+	}
+	available := time.Until(deadline) - stabilityFinalReserve()
+	if available <= 0 {
+		return 0
+	}
+	if desired > available {
+		return available
+	}
+	return desired
+}
+
+func stabilityNotificationContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	timeout := stabilityNotificationPostTimeout()
+	if deadline, ok := ctx.Deadline(); ok {
+		available := time.Until(deadline) - stabilityFinalReserve()
+		if available <= 0 {
+			return nil, nil, false
+		}
+		if timeout <= 0 || timeout > available {
+			timeout = available
+		}
+	}
+	if timeout <= 0 {
+		return ctx, func() {}, true
+	}
+	child, cancel := context.WithTimeout(ctx, timeout)
+	return child, cancel, true
+}
+
+func toolCallProgressToken(req *jsonrpc.Request) any {
+	if req == nil || req.Method != "tools/call" || len(req.Params) == 0 {
+		return nil
+	}
+	var params mcp.CallToolParamsRaw
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return nil
+	}
+	return params.GetProgressToken()
+}
+
+func waitStabilityDelay(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // Processor forwards polled control plane commands to the downstream MCP server.
 type Processor interface {
@@ -108,6 +244,136 @@ func (p *mcpProcessor) postTunnelResponse(ctx context.Context, requestID types.R
 		tunnelServiceRequestID: tunnelServiceRequestID,
 		err:                    err,
 	}
+}
+
+func (p *mcpProcessor) applyPreFinalStability(
+	ctx context.Context,
+	logger *slog.Logger,
+	cmd controlplane.JsonRpcCommand,
+	req *jsonrpc.Request,
+	channel types.Channel,
+	allowSyntheticProgress bool,
+) {
+	if !stabilityPreFinalEnabled() || req == nil || req.Method != "tools/call" {
+		return
+	}
+
+	desiredDelay := stabilityPreFinalDelay()
+	delay := stabilityWindow(ctx, desiredDelay)
+	if desiredDelay > 0 && delay <= 0 {
+		logger.DebugContext(ctx, "stability mode skipped pre-final window to preserve terminal response deadline",
+			slog.Duration("desired_delay", desiredDelay),
+			slog.Duration("final_reserve", stabilityFinalReserve()))
+		return
+	}
+
+	count := stabilityPreFinalNotifyCount()
+	progressToken := toolCallProgressToken(req)
+	useSyntheticProgress := progressToken != nil && allowSyntheticProgress
+	fallbackLogNotify := stabilityFallbackLogNotifyEnabled()
+	if count == 0 || (!useSyntheticProgress && !fallbackLogNotify) {
+		waitStabilityDelay(ctx, delay)
+		logger.DebugContext(ctx, "stability mode delayed terminal tool response",
+			slog.Duration("delay", delay),
+			slog.Bool("progress_token_present", progressToken != nil),
+			slog.Bool("synthetic_progress_allowed", allowSyntheticProgress),
+			slog.Bool("fallback_log_notify_enabled", fallbackLogNotify))
+		return
+	}
+
+	windowStarted := time.Now()
+	windowEnds := windowStarted.Add(delay)
+	for i := 0; i < count; i++ {
+		notificationKind := "progress"
+		var encoded []byte
+		var err error
+		if useSyntheticProgress {
+			params := mcp.ProgressNotificationParams{
+				ProgressToken: progressToken,
+				Progress:      float64(i + 1),
+				Total:         float64(count + 1),
+				Message:       "Tunnel stability heartbeat before final response",
+			}
+			encoded, err = json.Marshal(struct {
+				JSONRPC string                         `json:"jsonrpc"`
+				Method  string                         `json:"method"`
+				Params  mcp.ProgressNotificationParams `json:"params"`
+			}{
+				JSONRPC: "2.0",
+				Method:  "notifications/progress",
+				Params:  params,
+			})
+		} else {
+			notificationKind = "message"
+			encoded, err = json.Marshal(struct {
+				JSONRPC string `json:"jsonrpc"`
+				Method  string `json:"method"`
+				Params  struct {
+					Level  string `json:"level"`
+					Logger string `json:"logger"`
+					Data   any    `json:"data"`
+				} `json:"params"`
+			}{
+				JSONRPC: "2.0",
+				Method:  "notifications/message",
+				Params: struct {
+					Level  string `json:"level"`
+					Logger string `json:"logger"`
+					Data   any    `json:"data"`
+				}{
+					Level:  "debug",
+					Logger: "tunnel-stability",
+					Data: map[string]any{
+						"message": "pre-final heartbeat",
+						"index":   i + 1,
+						"count":   count,
+					},
+				},
+			})
+		}
+		if err != nil {
+			logger.WarnContext(ctx, "stability mode failed to encode pre-final notification", slog.String("error", err.Error()))
+			break
+		}
+
+		headers := http.Header{}
+		headers.Set("Content-Type", "application/json")
+		tunnelNotification := types.NewJSONRPCNotification(channel, encoded, http.StatusOK, headers)
+		notifyCtx, cancelNotify, ok := stabilityNotificationContext(ctx)
+		if !ok {
+			logger.DebugContext(ctx, "stability mode stopped notifications to preserve terminal response reserve")
+			break
+		}
+		post := p.postTunnelResponse(notifyCtx, cmd.RequestID(), tunnelNotification)
+		cancelNotify()
+		if post.err != nil {
+			logger.WarnContext(ctx, "stability mode pre-final notification failed; continuing to terminal response", post.errorAttrs()...)
+			break
+		}
+		logger.DebugContext(ctx, "stability mode posted pre-final notification",
+			slog.String("notification_kind", notificationKind),
+			slog.Int("notification_index", i+1),
+			slog.Int("notification_count", count))
+
+		target := windowStarted.Add(delay * time.Duration(i+1) / time.Duration(count))
+		if !waitStabilityDelay(ctx, time.Until(target)) {
+			return
+		}
+	}
+	waitStabilityDelay(ctx, time.Until(windowEnds))
+}
+
+func (p *mcpProcessor) postTerminalJSONRPCResponse(
+	ctx context.Context,
+	logger *slog.Logger,
+	cmd controlplane.JsonRpcCommand,
+	req *jsonrpc.Request,
+	channel types.Channel,
+	response *types.TunnelResponse,
+	allowSyntheticProgress bool,
+) responsePostResult {
+	p.applyPreFinalStability(ctx, logger, cmd, req, channel, allowSyntheticProgress)
+	return p.postTunnelResponse(ctx, cmd.RequestID(), response)
 }
 
 func (r responsePostResult) errorAttrs() []any {
@@ -285,6 +551,12 @@ func NewProcessor(p processorParams) (Processor, error) {
 		return registered[i].Name < registered[j].Name
 	})
 	baseLogger.Info("dispatcher channels registered", slog.Any("channels", registered))
+	if stabilityPreFinalEnabled() {
+		baseLogger.Info("stability pre-final keepalive enabled",
+			slog.Duration("delay", stabilityPreFinalDelay()),
+			slog.Int("notification_count", stabilityPreFinalNotifyCount()),
+			slog.Bool("fallback_log_notify", stabilityFallbackLogNotifyEnabled()))
+	}
 
 	forwardTraceContext := p.MCPConfig.ForwardTraceContext
 	for name := range p.MCPConfig.ExtraHeaders {
@@ -537,7 +809,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		respHeader.Set("Content-Type", "application/json")
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, status, respHeader)
-		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
+		post := p.postTerminalJSONRPCResponse(ctx, logger, cmd, req, channel, tunnelResponse, true)
 		if post.err != nil {
 			logger.ErrorContext(ctx, "failed to post error response to control plane", post.errorAttrs()...)
 			return post.err
@@ -590,7 +862,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		if !isNotification {
 			tunnelResponse = withResponseTiming(tunnelResponse, channelCfg.transportKind, writeResult.StartedAt, writeResult.CompletedAt)
 		}
-		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
+		post := p.postTerminalJSONRPCResponse(ctx, logger, cmd, req, channel, tunnelResponse, true)
 		if post.err != nil {
 			logger.ErrorContext(ctx, "failed to post preserved MCP error response to control plane", post.errorAttrs()...)
 			return post.err
@@ -626,7 +898,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		}
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, status, respHeader)
-		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
+		post := p.postTerminalJSONRPCResponse(ctx, logger, cmd, req, channel, tunnelResponse, true)
 		if post.err != nil {
 			logger.ErrorContext(ctx, "failed to post error response to control plane", post.errorAttrs()...)
 			return post.err
@@ -855,6 +1127,7 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 
 	req := cmd.Message().(*jsonrpc.Request)
 	notificationForwardingEnabled := true
+	downstreamProgressSeen := false
 	postTerminalErrorResponse := func(cause error) {
 		if cause == nil {
 			return
@@ -870,7 +1143,7 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 		}
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, statusCode, jsonRPCResponseHeaders(ctx, logger, responseHeaders))
-		post := p.postTunnelResponse(ttlCtx, cmd.RequestID(), tunnelResponse)
+		post := p.postTerminalJSONRPCResponse(ttlCtx, logger, cmd, req, channel, tunnelResponse, !downstreamProgressSeen)
 		if post.err != nil {
 			attrs := post.errorAttrs()
 			if errors.Is(post.err, context.DeadlineExceeded) || errors.Is(post.err, context.Canceled) {
@@ -926,6 +1199,9 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 		}
 
 		if notifyMsg, ok := asNotification(msg); ok {
+			if notifyMsg.Method == "notifications/progress" {
+				downstreamProgressSeen = true
+			}
 			if !notificationForwardingEnabled {
 				continue
 			}
@@ -992,7 +1268,7 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 		tunnelResponse := types.NewTunnelResponse(channel, encodedResponse, responseCode, responseHeaders)
 		tunnelResponse = withResponseTiming(tunnelResponse, transportKind, startedAt, completedAt)
 
-		post := p.postTunnelResponse(ttlCtx, cmd.RequestID(), tunnelResponse)
+		post := p.postTerminalJSONRPCResponse(ttlCtx, logger, cmd, req, channel, tunnelResponse, !downstreamProgressSeen)
 		if post.err != nil {
 			attrs := post.errorAttrs()
 			if errors.Is(post.err, context.DeadlineExceeded) || errors.Is(post.err, context.Canceled) {

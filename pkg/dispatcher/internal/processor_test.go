@@ -116,6 +116,197 @@ func TestResponsePostResultAttrs(t *testing.T) {
 	require.Equal(t, baseAttrs, responsePostResult{}.appendTunnelServiceRequestIDAttr(baseAttrs))
 }
 
+func TestPostTerminalJSONRPCResponseStabilityNotifications(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS", "0")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT", "2")
+
+	responder := newRecordingResponder()
+	processor := &mcpProcessor{tunnelResponder: responder}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id, err := jsonrpc.MakeID("rpc-1")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"echo","arguments":{},"_meta":{"progressToken":"progress-1"}}`),
+	}
+	cmd := &fakePolledCommand{id: "command-1", message: req}
+	final := types.NewTunnelResponse(types.DefaultChannel, json.RawMessage(`{"jsonrpc":"2.0","id":"rpc-1","result":{}}`), http.StatusOK, nil)
+
+	post := processor.postTerminalJSONRPCResponse(context.Background(), logger, cmd, req, types.DefaultChannel, final, true)
+	require.NoError(t, post.err)
+
+	responses := responder.waitForResponses(t, 3)
+	for i := 0; i < 2; i++ {
+		require.Equal(t, types.ResponseTypeJSONRPCNotification, responses[i].response.Type())
+		var notification struct {
+			JSONRPC string `json:"jsonrpc"`
+			Method  string `json:"method"`
+			Params  struct {
+				ProgressToken any     `json:"progressToken"`
+				Progress      float64 `json:"progress"`
+				Total         float64 `json:"total"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(responses[i].response.Payload(), &notification))
+		require.Equal(t, "2.0", notification.JSONRPC)
+		require.Equal(t, "notifications/progress", notification.Method)
+		require.Equal(t, "progress-1", notification.Params.ProgressToken)
+		require.Equal(t, float64(i+1), notification.Params.Progress)
+		require.Equal(t, float64(3), notification.Params.Total)
+	}
+	require.Same(t, final, responses[2].response)
+}
+
+func TestPostTerminalJSONRPCResponseStabilityWithoutProgressTokenDoesNotForgeNotification(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS", "0")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT", "2")
+	t.Setenv("TUNNEL_STABILITY_FALLBACK_LOG_NOTIFY", "false")
+
+	responder := newRecordingResponder()
+	processor := &mcpProcessor{tunnelResponder: responder}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id, err := jsonrpc.MakeID("rpc-2")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"echo","arguments":{}}`),
+	}
+	cmd := &fakePolledCommand{id: "command-2", message: req}
+	final := types.NewTunnelResponse(types.DefaultChannel, json.RawMessage(`{"jsonrpc":"2.0","id":"rpc-2","result":{}}`), http.StatusOK, nil)
+
+	post := processor.postTerminalJSONRPCResponse(context.Background(), logger, cmd, req, types.DefaultChannel, final, true)
+	require.NoError(t, post.err)
+	got := responder.waitForResponse(t)
+	require.Same(t, final, got.response)
+	select {
+	case extra := <-responder.responses:
+		t.Fatalf("unexpected synthetic response without progress token: type=%v", extra.response.Type())
+	default:
+	}
+}
+
+func TestPostTerminalJSONRPCResponseStabilityFallbackLogNotifications(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS", "0")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT", "2")
+	t.Setenv("TUNNEL_STABILITY_FALLBACK_LOG_NOTIFY", "true")
+
+	responder := newRecordingResponder()
+	processor := &mcpProcessor{tunnelResponder: responder}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id, err := jsonrpc.MakeID("rpc-3")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"echo","arguments":{}}`),
+	}
+	cmd := &fakePolledCommand{id: "command-3", message: req}
+	final := types.NewTunnelResponse(types.DefaultChannel, json.RawMessage(`{"jsonrpc":"2.0","id":"rpc-3","result":{}}`), http.StatusOK, nil)
+
+	post := processor.postTerminalJSONRPCResponse(context.Background(), logger, cmd, req, types.DefaultChannel, final, true)
+	require.NoError(t, post.err)
+
+	responses := responder.waitForResponses(t, 3)
+	for i := 0; i < 2; i++ {
+		require.Equal(t, types.ResponseTypeJSONRPCNotification, responses[i].response.Type())
+		var notification struct {
+			Method string `json:"method"`
+			Params struct {
+				Level  string         `json:"level"`
+				Logger string         `json:"logger"`
+				Data   map[string]any `json:"data"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(responses[i].response.Payload(), &notification))
+		require.Equal(t, "notifications/message", notification.Method)
+		require.Equal(t, "debug", notification.Params.Level)
+		require.Equal(t, "tunnel-stability", notification.Params.Logger)
+		require.Equal(t, "pre-final heartbeat", notification.Params.Data["message"])
+	}
+	require.Same(t, final, responses[2].response)
+}
+
+func TestPostTerminalJSONRPCResponseStabilitySkipsWindowNearDeadline(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS", "500")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT", "2")
+	t.Setenv("TUNNEL_STABILITY_FALLBACK_LOG_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_FINAL_RESERVE_MS", "3000")
+
+	responder := newRecordingResponder()
+	processor := &mcpProcessor{tunnelResponder: responder}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id, err := jsonrpc.MakeID("rpc-deadline")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"echo","arguments":{}}`),
+	}
+	cmd := &fakePolledCommand{id: "command-deadline", message: req}
+	final := types.NewTunnelResponse(types.DefaultChannel, json.RawMessage(`{"jsonrpc":"2.0","id":"rpc-deadline","result":{}}`), http.StatusOK, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	post := processor.postTerminalJSONRPCResponse(ctx, logger, cmd, req, types.DefaultChannel, final, true)
+	require.NoError(t, post.err)
+	require.Less(t, time.Since(started), 300*time.Millisecond, "stability window must not consume the final response reserve")
+
+	got := responder.waitForResponse(t)
+	require.Same(t, final, got.response)
+	select {
+	case extra := <-responder.responses:
+		t.Fatalf("unexpected synthetic response near deadline: type=%v", extra.response.Type())
+	default:
+	}
+}
+
+func TestPostTerminalJSONRPCResponseStabilityDoesNotRegressRealProgress(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY", "true")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_DELAY_MS", "0")
+	t.Setenv("TUNNEL_STABILITY_PRE_FINAL_NOTIFY_COUNT", "2")
+	t.Setenv("TUNNEL_STABILITY_FALLBACK_LOG_NOTIFY", "false")
+
+	responder := newRecordingResponder()
+	processor := &mcpProcessor{tunnelResponder: responder}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id, err := jsonrpc.MakeID("rpc-real-progress")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"echo","arguments":{},"_meta":{"progressToken":"progress-real"}}`),
+	}
+	cmd := &fakePolledCommand{id: "command-real-progress", message: req}
+	final := types.NewTunnelResponse(types.DefaultChannel, json.RawMessage(`{"jsonrpc":"2.0","id":"rpc-real-progress","result":{}}`), http.StatusOK, nil)
+
+	post := processor.postTerminalJSONRPCResponse(context.Background(), logger, cmd, req, types.DefaultChannel, final, false)
+	require.NoError(t, post.err)
+	got := responder.waitForResponse(t)
+	require.Same(t, final, got.response)
+	select {
+	case extra := <-responder.responses:
+		t.Fatalf("unexpected synthetic progress after real downstream progress: type=%v", extra.response.Type())
+	default:
+	}
+}
+
+func TestStabilityWindowPreservesFinalReserve(t *testing.T) {
+	t.Setenv("TUNNEL_STABILITY_FINAL_RESERVE_MS", "3000")
+
+	require.Equal(t, 500*time.Millisecond, stabilityWindow(context.Background(), 500*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	require.Zero(t, stabilityWindow(ctx, 500*time.Millisecond))
+}
+
 func TestProcessorForwardResponses(t *testing.T) {
 	t.Parallel()
 
