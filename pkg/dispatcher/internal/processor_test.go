@@ -3017,6 +3017,9 @@ func TestProcessorForwardResponsesContinuesToTerminalResponseWhenNotificationFor
 	}
 
 	require.NoError(t, processor.Process(context.Background(), cmd))
+	require.Contains(t, logs.String(), "dispatcher received command from control plane")
+	require.Contains(t, logs.String(), "rpc_method=ping")
+	require.Contains(t, logs.String(), "polled_at=")
 	response := recorder.waitForResponse(t)
 	require.Equal(t, cmd.id, response.requestID)
 	require.Equal(t, types.ResponseTypeJSONRPCResponse, response.response.Type())

@@ -655,6 +655,17 @@ func (p *mcpProcessor) Process(ctx context.Context, cmd controlplane.PolledComma
 	}
 	ctx = tunnelctx.ContextWithChannel(ctx, channel)
 
+	receivedAttrs := []any{slog.String("channel", channel.String())}
+	if polledAt := cmd.PolledAt(); !polledAt.IsZero() {
+		receivedAttrs = append(receivedAttrs, slog.Time("polled_at", polledAt))
+	}
+	if jsonRpcCmd, ok := cmd.(controlplane.JsonRpcCommand); ok {
+		if req, ok := jsonRpcCmd.Message().(*jsonrpc.Request); ok {
+			receivedAttrs = append(receivedAttrs, slog.String("rpc_method", req.Method))
+		}
+	}
+	logger.InfoContext(ctx, "dispatcher received command from control plane", receivedAttrs...)
+
 	channelCfg, ok := p.channels[channel]
 	if !ok || !channelCfg.isRoutable() {
 		return p.rejectUnsupportedChannel(ctx, logger, cmd, channel)
