@@ -46,6 +46,8 @@ var (
 	ErrClosed = errors.New("tunnel-client: client is closed")
 )
 
+type TracingConfig = config.TracingConfig
+
 // Config contains the settings needed by an embedded Tunnel client.
 //
 // TunnelID and APIKey are required. ControlPlaneBaseURL defaults to
@@ -53,6 +55,8 @@ var (
 // tunnel-client health/admin listener; the caller owns its application's
 // process lifecycle and observability surface.
 type Config struct {
+	Tracing             TracingConfig
+	ForwardTraceContext bool
 	TunnelID            string
 	APIKey              string
 	ControlPlaneBaseURL string
@@ -309,9 +313,13 @@ func buildConfig(cfg Config) (*config.Config, error) {
 	if err := validateControlPlaneExtraHeaders(extraHeaders); err != nil {
 		return nil, err
 	}
+	if err := cfg.Tracing.Validate(); err != nil {
+		return nil, err
+	}
 
 	return &config.Config{
 		ControlPlane: config.ControlPlaneConfig{
+			TraceContextEnabled:   cfg.Tracing.Enabled,
 			BaseURL:               baseURL,
 			URLPath:               urlPath,
 			TunnelID:              types.TunnelID(tunnelID),
@@ -326,7 +334,10 @@ func buildConfig(cfg Config) (*config.Config, error) {
 			Level:  cfg.LogLevel,
 			Format: config.LogFormatStructText,
 		},
+		Tracing: cfg.Tracing,
 		MCP: config.MCPConfig{
+			TraceContextEnabled:   cfg.Tracing.Enabled,
+			ForwardTraceContext:   cfg.ForwardTraceContext,
 			TransportKind:         config.MCPTransportInMemory,
 			ConnectionMaxTTL:      defaultMCPConnectionMaxTTL,
 			MaxConcurrentRequests: defaultMCPConcurrentRequests,

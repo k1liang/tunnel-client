@@ -34,7 +34,7 @@ func requireRuntimeSettingsType(*runtimeconfig.CloudflaredSettings) {}
 func TestCompatibilityAdapterDelegatesManifestAndState(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "2026.8.2", BundledVersion())
+	require.Equal(t, "2026.10.2", BundledVersion())
 	require.Equal(t, BundledVersion(), BundledManifest().Version)
 
 	state := NewState(&config.CloudflaredConfig{Token: "secret-token"})

@@ -49,6 +49,10 @@ type TraceContextProvider interface {
 	TraceContext() *types.TraceContext
 }
 
+type CommandTraceContextProvider interface {
+	CommandTraceContext() *types.TraceContext
+}
+
 // Fetcher abstracts the control-plane poll endpoint. Implementations should
 // honor the provided limit and return at most that many commands so the poller
 // can respect downstream backpressure. TunnelServiceRequestID is returned so

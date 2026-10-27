@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+import re
 import shutil
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 
-EXPECTED_ROOT = "cloudflared-733bfb939963e150dcf5c4faddb1603f744fbc98"
+EXPECTED_ROOT = "cloudflared-002a5ccaf75a4e612bfa451063c1d82a2d13336b"
+
+# Bazel's Python launcher can omit the script directory from sys.path. Load the
+# declared sibling helper by its exact path instead of ambient import search.
+VENDOR_HELPER = Path(__file__).with_name("extract_sbom_vendor.py")
+vendor_spec = importlib.util.spec_from_file_location("extract_sbom_vendor", VENDOR_HELPER)
+if vendor_spec is None or vendor_spec.loader is None:
+    raise RuntimeError(f"could not load vendor archive helper: {VENDOR_HELPER}")
+vendor_helper = importlib.util.module_from_spec(vendor_spec)
+vendor_spec.loader.exec_module(vendor_helper)
+VendorArchiveError = vendor_helper.VendorArchiveError
+extract_vendor_archive = vendor_helper.extract_archive
+tree_digest = vendor_helper.tree_digest
 
 
 class CloudflaredArchiveError(RuntimeError):
@@ -51,11 +65,23 @@ def safe_member_path(member_name: str) -> PurePosixPath:
     return path
 
 
-def extract_archive(archive: Path, output_root: Path) -> Path:
+def expected_vendor_digest(path: Path) -> str:
+    if not path.is_absolute() or not path.is_file():
+        raise fail("--vendor-digest must be an absolute file")
+    digest = path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise fail("--vendor-digest must contain one lowercase SHA256 digest")
+    return digest
+
+
+def extract_archive(
+    archive: Path, vendor_archive: Path, vendor_digest: Path, output_root: Path
+) -> Path:
     if not archive.is_absolute() or not archive.is_file():
         raise fail("--archive must be an absolute file")
     if output_root.exists() or output_root.is_symlink():
         raise fail("cloudflared output root already exists")
+    expected_digest = expected_vendor_digest(vendor_digest)
 
     with tarfile.open(archive, "r:gz") as source:
         members = source.getmembers()
@@ -65,6 +91,8 @@ def extract_archive(archive: Path, output_root: Path) -> Path:
         file_paths: set[PurePosixPath] = set()
         for member in members:
             member_path = safe_member_path(member.name)
+            if len(member_path.parts) > 1 and member_path.parts[1] == "vendor":
+                raise fail("cloudflared source archive must not contain a vendor tree")
             if member_path in seen_paths:
                 raise fail(f"cloudflared archive has a duplicate path: {member.name}")
             seen_paths.add(member_path)
@@ -99,21 +127,34 @@ def extract_archive(archive: Path, output_root: Path) -> Path:
             destination.chmod(member.mode & 0o777)
 
     source_root = output_root / EXPECTED_ROOT
-    for relative_path in ("go.mod", "vendor/modules.txt", "cmd/cloudflared/main.go"):
+    for relative_path in ("go.mod", "cmd/cloudflared/main.go"):
         if not (source_root / relative_path).is_file():
             raise fail(f"cloudflared source is missing {relative_path}")
+    extract_vendor_archive(source_root, vendor_archive)
+    actual_digest = tree_digest(source_root / "vendor")
+    if actual_digest != expected_digest:
+        raise fail(
+            f"cloudflared vendor tree digest mismatch: got {actual_digest}, want {expected_digest}"
+        )
     return source_root
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True)
+    parser.add_argument("--vendor-archive", required=True)
+    parser.add_argument("--vendor-digest", required=True)
     parser.add_argument("--output-root", required=True)
     args = parser.parse_args()
     try:
         output_root = require_test_tmpdir_child(args.output_root)
-        source_root = extract_archive(Path(args.archive), output_root)
-    except (CloudflaredArchiveError, OSError, tarfile.TarError) as error:
+        source_root = extract_archive(
+            Path(args.archive),
+            Path(args.vendor_archive),
+            Path(args.vendor_digest),
+            output_root,
+        )
+    except (CloudflaredArchiveError, VendorArchiveError, OSError, tarfile.TarError) as error:
         print(f"extract_sbom_cloudflared.py: {error}", file=sys.stderr)
         return 1
     print(source_root)

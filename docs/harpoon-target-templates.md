@@ -1,9 +1,17 @@
 # Harpoon target templates
 
 A target template gives a caller access to one configured HTTP operation with
-bounded identifier values. The operator fixes the HTTPS origin, GET/POST/PUT method,
+bounded identifier values. The operator fixes the origin, GET/POST/PUT method,
 path structure, query names, and authentication headers. Harpoon validates the
 arguments and constructs the request locally.
+
+HTTPS is the default. To reach a local HTTP API, set `allow_loopback_http: true`
+on that template and use a literal loopback IP with an explicit port, such as
+`http://127.0.0.1:23373` or `http://[::1]:23373`. DNS names, including
+`localhost`, and non-loopback IPs are rejected. This setting does not enable
+plaintext exact-URL targets and does not require `harpoon.allow_plaintext_http`.
+Loopback template calls always connect directly, ignoring configured and
+environment HTTP proxies so fixed credentials stay on the local connection.
 
 Templates require `config_version: 2` and `template.version: 1`. Existing
 exact-URL targets can share the same file. A target must have either `url` or
@@ -596,7 +604,8 @@ combined size; a profile can be saved before its credentials are available.
 
 | Field or input | Version 1 rule |
 | --- | --- |
-| `origin` | Literal `https://host` with an optional port from 1 to 65,535 and optional trailing `/`. No credentials, variable host, query, fragment, or other path. |
+| `origin` | Literal `https://host` with an optional port from 1 to 65,535 and optional trailing `/`. With `allow_loopback_http: true`, use `http://127.0.0.1:port` or `http://[::1]:port` (or another literal 127/8 address) with a required port. No credentials, variable host, query, fragment, or other path. |
+| `allow_loopback_http` | Omit or set to `false` for HTTPS. Set to `true` only for a literal loopback HTTP origin with a fixed port. |
 | `method` | Explicitly `GET`, `POST`, or `PUT`; POST/PUT require `body_policy`. DELETE and other methods are rejected. |
 | `path_template` | Absolute path. A placeholder occupies one complete segment, such as `/cases/{case_id}`. Empty segments, traversal segments, and partial placeholders such as `case-{id}` are rejected. |
 | `query` | At most 32 fixed, unique keys. Each key is 1–64 ASCII unreserved characters; its value is a fixed string or exactly one `{parameter}`. Fixed strings are valid UTF-8, contain no control characters, and are at most 256 bytes. Quote YAML booleans and numbers when using them as string literals. |
@@ -638,13 +647,14 @@ listed, including `Host`, `Cookie`, `User-Agent`, `Forwarded`, `X-Forwarded-*`,
 
 ## Proxy connectivity checks
 
-When a template uses an HTTP proxy, the full client's proxy health checker tests
+When an HTTPS template uses an HTTP proxy, the full client's proxy health checker tests
 CONNECT to the template's fixed origin host and port. It never supplies parameter
 values, sends target authentication headers, or invokes the HTTP operation.
 Successful CONNECT confirms proxy connectivity; it does not establish that a
 specific resource exists or that the target will authorize a request. A rejected
 CONNECT marks proxy health as degraded even when only template targets use that
-proxy. Direct routes do not initiate a proxy check.
+proxy. Loopback HTTP templates are direct routes, regardless of proxy settings,
+and do not initiate a proxy check.
 
 ## Authorization and privacy
 

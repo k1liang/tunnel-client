@@ -497,12 +497,19 @@ func buildRoutes(controlPlane *config.ControlPlaneConfig, mcp *config.MCPConfig,
 			return nil, err
 		}
 		for _, target := range targets {
-			// A compiled template's BaseURL contains only its fixed HTTPS
-			// origin. Proxy checks send CONNECT to its host:port; they never
-			// render a template or issue an HTTP operation through the tunnel.
+			// A compiled template's BaseURL contains only its fixed origin.
+			// Proxy checks never render or invoke a template operation.
 			name := target.Label
 			if name == "" && target.BaseURL != nil {
 				name = target.BaseURL.Hostname()
+			}
+			if target.IsLoopbackHTTPTemplate() {
+				// These requests use a direct transport even when an explicit
+				// proxy or HTTP_PROXY is configured.
+				route := proxy.ResolveRoute(proxy.RouteKindHarpoon, name, target.BaseURL, nil, config.ProxySourceIgnored, func(string) (string, bool) { return "", false })
+				route.ProxySource = config.ProxySourceIgnored
+				routes = append(routes, route)
+				continue
 			}
 			routes = append(routes, proxy.ResolveRoute(proxy.RouteKindHarpoon, name, target.BaseURL, harpoonCfg.HTTPProxy, harpoonCfg.HTTPProxySource, lookupEnv))
 		}

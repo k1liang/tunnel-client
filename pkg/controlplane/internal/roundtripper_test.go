@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -35,7 +36,7 @@ func TestControlPlaneRoundTripperAddsDefaultHeaders(t *testing.T) {
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		seen = req.Header.Clone()
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), apiKey, userAgent, "", staticMCPServerInfoHeader(serverInfo), map[string]string{"extra-header": "true"}, newDiscardLogger())
+	}), staticBearerToken(apiKey), userAgent, "", staticMCPServerInfoHeader(serverInfo), map[string]string{"extra-header": "true"}, newDiscardLogger())
 
 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
 	if !assert.NoError(t, err, "build request") {
@@ -69,7 +70,7 @@ func TestControlPlaneRoundTripperAddsOrganizationHeader(t *testing.T) {
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		seen = req.Header.Clone()
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), "api-key", "ua", organizationID, nil, map[string]string{"openai-organization": "org-extra"}, newDiscardLogger())
+	}), staticBearerToken("api-key"), "ua", organizationID, nil, map[string]string{"openai-organization": "org-extra"}, newDiscardLogger())
 
 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
 	if !assert.NoError(t, err, "build request") {
@@ -89,7 +90,7 @@ func TestControlPlaneRoundTripperWarnsOnOverride(t *testing.T) {
 
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), "api-key", "ua", "", nil, map[string]string{"X-Debug": "new"}, logger)
+	}), staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Debug": "new"}, logger)
 
 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
 	if !assert.NoError(t, err, "build request") {
@@ -113,7 +114,7 @@ func TestControlPlaneRoundTripperPreservesProtectedHeaders(t *testing.T) {
 
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), "api-key", "ua", "", staticMCPServerInfoHeader(serverInfo), map[string]string{
+	}), staticBearerToken("api-key"), "ua", "", staticMCPServerInfoHeader(serverInfo), map[string]string{
 		"authorization":                "Bearer attacker",
 		"User-Agent":                   "custom-agent",
 		headerTunnelClientVersion:      "dev",
@@ -148,7 +149,7 @@ func TestControlPlaneRoundTripperNoWarningWhenValueMatches(t *testing.T) {
 
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), "api-key", "ua", "", nil, map[string]string{"X-Same": "same"}, logger)
+	}), staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Same": "same"}, logger)
 
 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
 	if !assert.NoError(t, err, "build request") {
@@ -169,7 +170,7 @@ func TestControlPlaneRoundTripperRejectsInvalidMCPServerInfo(t *testing.T) {
 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-	}), "api-key", "ua", "", func() (string, error) {
+	}), staticBearerToken("api-key"), "ua", "", func() (string, error) {
 		return "", errors.New("invalid declaration")
 	}, nil, newDiscardLogger())
 
@@ -191,9 +192,13 @@ func TestNewControlPlaneRoundTripperPanicsOnNilLogger(t *testing.T) {
 		func() {
 			_ = newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-			}), "api-key", "ua", "", nil, nil, nil)
+			}), staticBearerToken("api-key"), "ua", "", nil, nil, nil)
 		},
 	)
+}
+
+func staticBearerToken(value string) func(context.Context) (string, error) {
+	return func(context.Context) (string, error) { return value, nil }
 }
 
 func staticMCPServerInfoHeader(value string) func() (string, error) {

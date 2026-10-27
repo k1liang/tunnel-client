@@ -318,6 +318,31 @@ func TestMockMCPServerIgnoresCanceledPostBodyRead(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 }
 
+func TestMockMCPServerWithoutOAuthMetadata(t *testing.T) {
+	t.Parallel()
+
+	server := NewMockMCPServer()
+	server.Start(t)
+	for _, path := range []string{wellKnownOAuthProtectedResourcePath, wellKnownOAuthProtectedResourcePath + "/mcp"} {
+		t.Run(path, func(t *testing.T) {
+			metadataURL := server.BaseURL().ResolveReference(&url.URL{Path: path})
+			req, err := http.NewRequest(http.MethodGet, metadataURL.String(), nil)
+			if err != nil {
+				t.Fatalf("create metadata request: %v", err)
+			}
+			req.Header.Set("Accept", "application/json")
+			resp, err := httpClientForServer(t, server).Do(req)
+			if err != nil {
+				t.Fatalf("GET metadata: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("unconfigured metadata status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+			}
+		})
+	}
+}
+
 func TestMockMCPServerOAuthMetadata(t *testing.T) {
 	t.Parallel()
 

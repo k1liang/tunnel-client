@@ -28,15 +28,15 @@ func TestBundledManifestPinsProxyBuiltModule(t *testing.T) {
 	t.Parallel()
 
 	manifest := BundledManifest()
-	require.Equal(t, "2026.8.2", BundledVersion())
-	require.Equal(t, "https://github.com/cloudflare/cloudflared/releases/tag/2026.8.2", manifest.ReleaseURL)
-	require.Equal(t, "733bfb939963e150dcf5c4faddb1603f744fbc98", manifest.ReleaseCommit)
+	require.Equal(t, "2026.10.2", BundledVersion())
+	require.Equal(t, "https://github.com/cloudflare/cloudflared/releases/tag/2026.10.2", manifest.ReleaseURL)
+	require.Equal(t, "002a5ccaf75a4e612bfa451063c1d82a2d13336b", manifest.ReleaseCommit)
 	require.Equal(t, "github.com/cloudflare/cloudflared", manifest.ModulePath)
 	require.Equal(t, "github.com/cloudflare/cloudflared/cmd/cloudflared", manifest.PackagePath)
-	require.Equal(t, "v0.0.0-20260814112252-733bfb939963", manifest.ModuleVersion)
-	require.Equal(t, "h1:bDpUfzzz9W6u6C9deKDAjpLwyiCV/DdOoJaEzG6I3RQ=", manifest.ModuleSum)
-	require.Equal(t, "h1:v97UyAHiewwyRGcpkuzO3d1Jbv4I8OBPuEjOAK5mZ08=", manifest.GoModSum)
-	require.Equal(t, "2026-08-14T12:23:25Z", manifest.BuildTime)
+	require.Equal(t, "v0.0.0-20261020083048-002a5ccaf75a", manifest.ModuleVersion)
+	require.Equal(t, "h1:PvDY0bQyZwLrmQ9fk+RL2zkW58IW8CbwTDAHcJOGVpg=", manifest.ModuleSum)
+	require.Equal(t, "h1:adGqTSUMcDAaylEKSXrVGZYqhC8UlGZgAVeGZM0OnV8=", manifest.GoModSum)
+	require.Equal(t, "2026-10-20T09:17:30Z", manifest.BuildTime)
 	require.Equal(t, "tunnel-client maintainers", manifest.SecurityPatchOwner)
 	require.Equal(t, []string{
 		"linux/amd64",

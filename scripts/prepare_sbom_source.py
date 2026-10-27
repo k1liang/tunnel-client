@@ -81,6 +81,16 @@ def canonicalize_source(args: argparse.Namespace) -> None:
             if old_module_path in contents:
                 path.write_bytes(contents.replace(old_module_path, new_module_path))
 
+    # The baseline build already links this version, but version.go also embeds
+    # VERSION. Normalize only the action-private copy before compiling it.
+    version_dir = root / "pkg" / "version"
+    version_file = version_dir / "VERSION"
+    if any(path.is_symlink() for path in (root / "pkg", version_dir, version_file)):
+        raise fail("staged pkg/version/VERSION must not use symlinks")
+    if not version_file.is_file():
+        raise fail("staged pkg/version/VERSION must be a regular file")
+    version_file.write_bytes(b"0.0.0-baseline\n")
+
 
 def print_cloudflared_metadata(args: argparse.Namespace) -> None:
     manifest_path = require_test_tmpdir_child(args.manifest, "--manifest", directory=False)

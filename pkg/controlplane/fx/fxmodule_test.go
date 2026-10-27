@@ -26,8 +26,10 @@ import (
 	"github.com/openai/tunnel-client/pkg/harpoon"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/mcpserverinfo"
+	"github.com/openai/tunnel-client/pkg/metrics"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
+	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
 	"github.com/openai/tunnel-client/pkg/runtimehealth"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/tunnelctx"
@@ -505,6 +507,224 @@ func TestRunPollerWaitsForMCPStartupProbeBeforeFirstPoll(t *testing.T) {
 		t.Fatal("poller did not start after MCP startup probe completed")
 	}
 	app.RequireStop()
+}
+
+func TestRunPollerWaitsForStartupCatalog(t *testing.T) {
+	t.Parallel()
+
+	waitLog := newSignalWriter("waiting for startup catalog before first control-plane poll")
+	logger := slog.New(slog.NewTextHandler(waitLog, nil))
+	catalog := hostbus.NewStartupCatalogState()
+	poller := &recordingPoller{started: make(chan struct{})}
+	app := fxtest.New(t,
+		fx.Supply(logger, catalog),
+		fx.Supply(fx.Annotate(poller, fx.As(new(internal.Poller)))),
+		fx.Invoke(runPoller),
+	)
+	app.RequireStart()
+	t.Cleanup(app.RequireStop)
+	select {
+	case <-poller.started:
+		t.Fatal("poller consumed work before startup target registration completed")
+	case <-waitLog.Seen():
+	case <-time.After(time.Second):
+		t.Fatal("poller did not reach startup catalog wait")
+	}
+	select {
+	case <-poller.started:
+		t.Fatal("poller started with a pending startup catalog")
+	default:
+	}
+
+	// Successful finalization also permits an empty catalog for non-OAuth MCP.
+	catalog.Complete(nil)
+	select {
+	case <-poller.started:
+	case <-time.After(time.Second):
+		t.Fatal("poller did not start after target registration completed")
+	}
+}
+
+func TestRunPollerRejectsFailedStartupCatalog(t *testing.T) {
+	t.Parallel()
+
+	failureLog := newSignalWriter("startup catalog failed; control-plane polling disabled")
+	logger := slog.New(slog.NewTextHandler(failureLog, nil))
+	catalog := hostbus.NewStartupCatalogState()
+	catalog.Complete(errors.New("invalid OAuth metadata"))
+	poller := &recordingPoller{started: make(chan struct{})}
+	app := fxtest.New(t,
+		fx.Supply(logger, catalog),
+		fx.Supply(fx.Annotate(poller, fx.As(new(internal.Poller)))),
+		fx.Invoke(runPoller),
+	)
+	app.RequireStart()
+	t.Cleanup(app.RequireStop)
+	select {
+	case <-poller.started:
+		t.Fatal("client with a failed startup catalog consumed work")
+	case <-failureLog.Seen():
+	case <-time.After(time.Second):
+		t.Fatal("failed catalog was not observed")
+	}
+}
+
+func TestRunPollerCancelsStartupCatalogWait(t *testing.T) {
+	t.Parallel()
+
+	waitLog := newSignalWriter("waiting for startup catalog before first control-plane poll")
+	logger := slog.New(slog.NewTextHandler(waitLog, nil))
+	catalog := hostbus.NewStartupCatalogState()
+	poller := &recordingPoller{started: make(chan struct{})}
+	app := fxtest.New(t,
+		fx.Supply(logger, catalog),
+		fx.Supply(fx.Annotate(poller, fx.As(new(internal.Poller)))),
+		fx.Invoke(runPoller),
+	)
+	app.RequireStart()
+	select {
+	case <-poller.started:
+		app.RequireStop()
+		t.Fatal("poller started before cancellation of pending catalog")
+	case <-waitLog.Seen():
+	case <-time.After(time.Second):
+		app.RequireStop()
+		t.Fatal("poller did not reach startup catalog wait")
+	}
+	app.RequireStop()
+	select {
+	case <-poller.started:
+		t.Fatal("poller started during shutdown")
+	default:
+	}
+}
+
+func TestRunPollerExplicitNonHarpoonScopeDoesNotWaitForCatalog(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	catalog := hostbus.NewStartupCatalogState()
+	controlPlane := &config.ControlPlaneConfig{PollChannelsConfigured: true, PollChannels: []types.Channel{types.DefaultChannel}}
+	poller := &recordingPoller{started: make(chan struct{})}
+	app := fxtest.New(t,
+		fx.Supply(logger, catalog, controlPlane),
+		fx.Supply(fx.Annotate(poller, fx.As(new(internal.Poller)))),
+		fx.Invoke(runPoller),
+	)
+	app.RequireStart()
+	t.Cleanup(app.RequireStop)
+	select {
+	case <-poller.started:
+	case <-time.After(time.Second):
+		t.Fatal("explicit main-only poller was blocked by unrelated Harpoon discovery")
+	}
+}
+
+func TestRunPollerPreservesLegacyHostBus(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	catalog := hostbus.NewStartupCatalogState()
+	catalog.Complete(errors.New("startup acknowledgement unavailable"))
+	poller := &recordingPoller{started: make(chan struct{})}
+	app := fxtest.New(t,
+		fx.Supply(logger, catalog),
+		fx.Supply(fx.Annotate(legacyHostBus{}, fx.As(new(hostbus.HostRegistrationBus)))),
+		fx.Supply(fx.Annotate(poller, fx.As(new(internal.Poller)))),
+		fx.Invoke(runPoller),
+	)
+	app.RequireStart()
+	t.Cleanup(app.RequireStop)
+	select {
+	case <-poller.started:
+	case <-time.After(time.Second):
+		t.Fatal("legacy host-bus implementation was blocked by unsupported acknowledgement")
+	}
+}
+
+type legacyHostBus struct{}
+
+func (legacyHostBus) Publish(context.Context, hostbus.URLBundle) error { return nil }
+func (legacyHostBus) Close() error                                     { return nil }
+
+func TestStartupCatalogReadinessMatchesPollingEligibility(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name       string
+		noCatalog  bool
+		mainOnly   bool
+		legacyBus  bool
+		completion error
+	}{
+		{name: "registration succeeds"},
+		{name: "registration fails", completion: errors.New("private registration failure")},
+		{name: "catalog absent", noCatalog: true},
+		{name: "explicit main only", mainOnly: true},
+		{name: "legacy bus", legacyBus: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			catalog := hostbus.NewStartupCatalogState()
+			if testCase.noCatalog {
+				catalog = nil
+			}
+			controlPlane := &runtimeconfig.ControlPlaneConfig{}
+			if testCase.mainOnly {
+				controlPlane.PollChannelsConfigured = true
+				controlPlane.PollChannels = []types.Channel{types.DefaultChannel}
+			}
+			meter := sdkmetric.NewMeterProvider()
+			t.Cleanup(func() { _ = meter.Shutdown(context.Background()) })
+			var mux *http.ServeMux
+			var service runtimehealth.Service
+			options := []fx.Option{
+				fx.NopLogger,
+				runtimehealth.Module,
+				fx.Supply(controlPlane, meter, &runtimeconfig.HealthConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil))),
+				fx.Provide(
+					func() metrics.MetricsExporter { return http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}) },
+					fx.Annotate(newStartupCatalogReadinessGate, fx.ResultTags(`group:"runtime_readiness_gates"`)),
+				),
+				fx.Populate(&service),
+				fx.Invoke(func(p struct {
+					fx.In
+					Mux *http.ServeMux `name:"admin_mux"`
+				}) {
+					mux = p.Mux
+				}),
+			}
+			if catalog != nil {
+				options = append(options, fx.Supply(catalog))
+			}
+			if testCase.legacyBus {
+				options = append(options, fx.Supply(fx.Annotate(legacyHostBus{}, fx.As(new(hostbus.HostRegistrationBus)))))
+			}
+			app := fx.New(options...)
+			if err := app.Err(); err != nil {
+				t.Fatal(err)
+			}
+			checkReady := func(wantStatus int, wantBody string) {
+				t.Helper()
+				recorder := httptest.NewRecorder()
+				mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+				if recorder.Code != wantStatus || recorder.Body.String() != wantBody {
+					t.Fatalf("readyz = %d %q, want %d %q", recorder.Code, recorder.Body.String(), wantStatus, wantBody)
+				}
+			}
+			bypass := testCase.noCatalog || testCase.mainOnly || testCase.legacyBus
+			if bypass {
+				checkReady(http.StatusOK, "ready")
+			} else {
+				checkReady(http.StatusServiceUnavailable, "startup catalog pending")
+			}
+			catalog.Complete(testCase.completion)
+			if testCase.completion != nil && !bypass {
+				checkReady(http.StatusServiceUnavailable, "startup catalog failed")
+			} else {
+				checkReady(http.StatusOK, "ready")
+			}
+		})
+	}
 }
 
 func TestWaitForMCPStartupBeforePollingFailsOpenAfterProbeFailure(t *testing.T) {

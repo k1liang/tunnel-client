@@ -1,6 +1,7 @@
 package runtimeconfig
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -39,12 +40,97 @@ const (
 	MCPTransportInMemory       MCPTransportKind = "in-memory"
 )
 
+// StdioFailurePolicy selects who recovers an unexpectedly closed stdio MCP
+// child. The zero value behaves like StdioFailurePolicyRestart for callers
+// constructing MCPConfig directly.
+type StdioFailurePolicy string
+
+const (
+	StdioFailurePolicyRestart StdioFailurePolicy = "restart"
+	StdioFailurePolicyExit    StdioFailurePolicy = "exit"
+)
+
 // HarpoonTransportKind enumerates supported harpoon transports.
 type HarpoonTransportKind string
 
 const (
 	HarpoonTransportHTTPStreamable HarpoonTransportKind = "http-streamable"
 )
+
+// RequestIDForwarding selects the HTTP egress surfaces that receive the
+// original inbound X-Request-Id. The zero value preserves MCP forwarding for
+// callers that construct Config directly instead of loading it from a file.
+type RequestIDForwarding uint8
+
+const (
+	ForwardRequestIDMCP RequestIDForwarding = 1 << iota
+	ForwardRequestIDHarpoon
+	ForwardRequestIDOAuth
+	ForwardRequestIDNone
+)
+
+// AllowsMCP reports whether the original request ID should be forwarded to an
+// MCP HTTP target. A zero-value Config retains the historical MCP behavior.
+func (surfaces RequestIDForwarding) AllowsMCP() bool {
+	return surfaces&ForwardRequestIDNone == 0 && (surfaces == 0 || surfaces&ForwardRequestIDMCP != 0)
+}
+
+// AllowsHarpoon reports whether the original request ID should be forwarded to
+// a Harpoon HTTP target.
+func (surfaces RequestIDForwarding) AllowsHarpoon() bool {
+	return surfaces&ForwardRequestIDNone == 0 && surfaces&ForwardRequestIDHarpoon != 0
+}
+
+// AllowsOAuth reports whether the original request ID should be forwarded on
+// eligible OAuth HTTP requests. OAuth is opt-in, including for zero-value Config.
+func (surfaces RequestIDForwarding) AllowsOAuth() bool {
+	return surfaces&ForwardRequestIDNone == 0 && surfaces&ForwardRequestIDOAuth != 0
+}
+
+func parseRequestIDForwarding(raw string) (RequestIDForwarding, error) {
+	if raw == "" {
+		return 0, errors.New("forward_request_id must contain mcp, harpoon, oauth, or none")
+	}
+	var surfaces RequestIDForwarding
+	for name := range strings.SplitSeq(raw, ",") {
+		switch strings.TrimSpace(name) {
+		case "mcp":
+			surfaces |= ForwardRequestIDMCP
+		case "harpoon":
+			surfaces |= ForwardRequestIDHarpoon
+		case "oauth":
+			surfaces |= ForwardRequestIDOAuth
+		case "none":
+			surfaces |= ForwardRequestIDNone
+		case "":
+			return 0, errors.New("forward_request_id contains an empty surface")
+		default:
+			return 0, fmt.Errorf("forward_request_id has unknown surface %q", strings.TrimSpace(name))
+		}
+	}
+	if surfaces&ForwardRequestIDNone != 0 && surfaces != ForwardRequestIDNone {
+		return 0, errors.New("forward_request_id cannot combine none with another surface")
+	}
+	return surfaces, nil
+}
+
+func resolveRequestIDForwarding(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) (RequestIDForwarding, error) {
+	if flag := fs.Lookup("forward-request-id"); flag != nil && flag.Changed {
+		surfaces, err := parseRequestIDForwarding(flag.Value.String())
+		if err != nil {
+			return 0, fmt.Errorf("invalid --forward-request-id: %w", err)
+		}
+		return surfaces, nil
+	}
+	if raw, ok := lookupEnv("FORWARD_REQUEST_ID"); ok {
+		surfaces, err := parseRequestIDForwarding(raw)
+		if err != nil {
+			return 0, fmt.Errorf("invalid FORWARD_REQUEST_ID: %w", err)
+		}
+		return surfaces, nil
+	}
+	return ForwardRequestIDMCP, nil
+}
 
 const (
 	defaultControlPlaneBaseURL                         = "https://api.openai.com"
@@ -91,8 +177,10 @@ var (
 	errMissingControlPlaneAPIKey   = errors.New("control plane API key is required; set --control-plane.api-key (env:/file:) or CONTROL_PLANE_API_KEY or OPENAI_API_KEY")
 	errMalformedControlPlaneAPIKey = errors.New("control plane API key is malformed")
 	controlPlaneAPIKeyPattern      = regexp.MustCompile("^[0-9A-Za-z_-]+$")
-	tunnelIDPattern                = regexp.MustCompile(`^tunnel_([a-z0-9]{4}_)?[a-z0-9]{32}$`)
-	logFormatToString              = map[LogFormat]string{
+	// RFC 6750 section 2.1 permits dots in bearer tokens, including signed JWTs.
+	bearerTokenPattern = regexp.MustCompile(`^[A-Za-z0-9._~+/-]+=*$`)
+	tunnelIDPattern    = regexp.MustCompile(`^tunnel_([a-z0-9]{4}_)?[a-z0-9]{32}$`)
+	logFormatToString  = map[LogFormat]string{
 		LogFormatStructText: "struct-text",
 		LogFormatJSON:       "json",
 	}
@@ -112,6 +200,21 @@ func ValidateControlPlaneAPIKey(key string) error {
 		return errMalformedControlPlaneAPIKey
 	}
 	return nil
+}
+
+// BearerToken returns the credential for the next control-plane request.
+func (c *ControlPlaneConfig) BearerToken(ctx context.Context) (string, error) {
+	if c.TokenProvider == nil {
+		return c.APIKey, ValidateControlPlaneAPIKey(c.APIKey)
+	}
+	token, err := c.TokenProvider(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !bearerTokenPattern.MatchString(token) {
+		return "", errors.New("workload identity returned a malformed bearer token")
+	}
+	return token, nil
 }
 
 type flagAlias struct {
@@ -167,6 +270,7 @@ var commonFlagAliases = []flagAlias{
 type Config struct {
 	ControlPlane ControlPlaneConfig
 	Logging      LoggingConfig
+	Tracing      TracingConfig
 	Health       HealthConfig
 	Process      ProcessConfig
 	MCP          MCPConfig
@@ -188,12 +292,14 @@ type RuntimeConfig struct {
 
 // ControlPlaneConfig defines how the client reaches the tunnel control plane.
 type ControlPlaneConfig struct {
+	TraceContextEnabled   bool
 	BaseURL               *url.URL
 	UnixSocketPath        string
 	URLPath               string
 	TunnelID              types.TunnelID
 	OrganizationID        string
 	APIKey                string
+	TokenProvider         func(context.Context) (string, error) `json:"-" yaml:"-"`
 	MaxInFlightRequests   int
 	PollTimeout           time.Duration
 	InitialPollTimeout    time.Duration
@@ -281,13 +387,14 @@ type CloudflaredConfig struct {
 // MCPChannelBinding first, then projected to the legacy fields only for
 // compatibility.
 type MCPConfig struct {
-	ServerURL         *url.URL
-	UnixSocketPath    string
-	Command           string
-	CommandArgs       []string
-	TransportKind     MCPTransportKind
-	ClientCertificate *tlsconfig.ClientCertificate
-	ChannelBindings   []MCPChannelBinding
+	TraceContextEnabled bool
+	ServerURL           *url.URL
+	UnixSocketPath      string
+	Command             string
+	CommandArgs         []string
+	TransportKind       MCPTransportKind
+	ClientCertificate   *tlsconfig.ClientCertificate
+	ChannelBindings     []MCPChannelBinding
 	// AllowNoMain is set only for an explicit poll allowlist that excludes main.
 	// It keeps zero-value MCPConfig compatibility for older callers.
 	AllowNoMain bool
@@ -298,9 +405,16 @@ type MCPConfig struct {
 	// MCP lifecycle when an older caller omits notifications/initialized. False
 	// preserves the legacy verbatim-forwarding behavior for existing servers.
 	StdioSendInitializedNotification bool
+	// StdioFailurePolicy controls recovery after an unexpected stdio child loss.
+	// The zero value uses internal restart; exit delegates recovery to an
+	// external supervisor.
+	StdioFailurePolicy StdioFailurePolicy
 	// ForwardTraceContext opts in to forwarding validated tunnel trace context
 	// through MCP params._meta. False preserves the caller's request metadata.
-	ForwardTraceContext   bool
+	ForwardTraceContext bool
+	// ForwardRequestID controls automatic propagation of the original inbound
+	// HTTP X-Request-Id to selected MCP HTTP, Harpoon, and OAuth egress requests.
+	ForwardRequestID      RequestIDForwarding
 	ConnectionMaxTTL      time.Duration
 	MaxConcurrentRequests int
 	ExtraHeaders          map[string]string
@@ -416,16 +530,18 @@ type HarpoonTarget struct {
 
 // HarpoonTargetTemplate defines an opt-in operation with an operator-fixed
 // destination and bounded caller-supplied identifiers. Version 1 permits GET,
-// POST, and PUT over HTTPS and never follows redirects. Writes require a body policy.
+// POST, and PUT over HTTPS, or loopback HTTP with an explicit opt-in, and never
+// follows redirects. Writes require a body policy.
 type HarpoonTargetTemplate struct {
-	Version      int                                 `yaml:"version" json:"version"`
-	Origin       string                              `yaml:"origin" json:"origin"`
-	Method       string                              `yaml:"method" json:"method"`
-	BodyPolicy   *HarpoonTemplateBodyPolicy          `yaml:"body_policy,omitempty" json:"body_policy,omitempty"`
-	PathTemplate string                              `yaml:"path_template" json:"path_template"`
-	Query        map[string]string                   `yaml:"query" json:"query,omitempty"`
-	Parameters   map[string]HarpoonTemplateParameter `yaml:"parameters" json:"parameters"`
-	Headers      map[string]string                   `yaml:"headers" json:"headers,omitempty"`
+	Version           int                                 `yaml:"version" json:"version"`
+	Origin            string                              `yaml:"origin" json:"origin"`
+	AllowLoopbackHTTP bool                                `yaml:"allow_loopback_http,omitempty" json:"allow_loopback_http,omitempty"`
+	Method            string                              `yaml:"method" json:"method"`
+	BodyPolicy        *HarpoonTemplateBodyPolicy          `yaml:"body_policy,omitempty" json:"body_policy,omitempty"`
+	PathTemplate      string                              `yaml:"path_template" json:"path_template"`
+	Query             map[string]string                   `yaml:"query" json:"query,omitempty"`
+	Parameters        map[string]HarpoonTemplateParameter `yaml:"parameters" json:"parameters"`
+	Headers           map[string]string                   `yaml:"headers" json:"headers,omitempty"`
 	// AllowedHeaders preserves the original Go API for name-only entries.
 	// HeaderRules supports both name-only and structured entries; decoding and
 	// encoding retain the operator's header_rules or allowed_headers spelling.
@@ -517,11 +633,14 @@ func WriteUsage(fs *pflag.FlagSet, w io.Writer) {
 	_, _ = fmt.Fprintf(fs.Output(), "Usage of %s:\n", name)
 	fs.PrintDefaults()
 	_, _ = fmt.Fprintln(fs.Output(), "\nEnvironment variables:")
-	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_API_KEY\tAPI key used to authenticate to the tunnel control plane (required; preferred)")
+	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_API_KEY\tAPI key used to authenticate to the tunnel control plane (unless using AWS workload identity)")
+	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID, CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID\tOpenAI IDs for AWS workload identity")
 	_, _ = fmt.Fprintln(fs.Output(), "  OPENAI_API_KEY\tAPI key env var used when CONTROL_PLANE_API_KEY unset")
 	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_TUNNEL_ID\tIdentifier for this client/tunnel (required)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_SERVER_URL or MCP_COMMAND\tMain MCP target (required unless poll channels exclude main)")
+	_, _ = fmt.Fprintln(fs.Output(), "  MCP_STDIO_FAILURE_POLICY\tRecovery after an unexpected stdio child loss: restart or exit (default: restart)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_FORWARD_TRACE_CONTEXT\tOpt in to forwarding traceparent/tracestate through MCP params._meta (default: false)")
+	_, _ = fmt.Fprintln(fs.Output(), "  FORWARD_REQUEST_ID\tHTTP egress surfaces for the original X-Request-Id (default: mcp)")
 }
 
 // RegisterFlags attaches only the approved customer runtime flags to fs.
@@ -533,6 +652,7 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	}
 	registerTLSFlags(fs)
 	fs.String("config", "", "Path to YAML config file (env.TUNNEL_CLIENT_CONFIG). Precedence: flags > environment > YAML > defaults")
+	fs.String("forward-request-id", "mcp", "HTTP egress surfaces receiving the original X-Request-Id: comma-separated mcp, harpoon, oauth (queued discovery at configured MCP origin only); or none (env.FORWARD_REQUEST_ID)")
 	fs.String("profile", "", "Profile name to load from the profile directory (env.TUNNEL_CLIENT_PROFILE)")
 	fs.String("profile-file", "", "Path to a specific profile YAML file (env.TUNNEL_CLIENT_PROFILE_FILE)")
 	fs.String("profile-dir", "", "Directory containing profile YAML files (env.TUNNEL_CLIENT_PROFILE_DIR; default $XDG_CONFIG_HOME/tunnel-client or ~/.config/tunnel-client)")
@@ -541,6 +661,8 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	fs.String("control-plane.tunnel-id", "", "Identifier for this client/tunnel (env.CONTROL_PLANE_TUNNEL_ID)")
 	fs.String("control-plane.organization-id", "", "Organization ID to send as OpenAI-Organization on tunnel control-plane requests (env.CONTROL_PLANE_ORGANIZATION_ID)")
 	fs.String("control-plane.api-key", "", "Reference to environment variable or file containing the control-plane API key (format env:VARNAME or file:/path/to/secret)")
+	fs.String("control-plane.aws-identity-provider-id", "", "OpenAI identity provider ID for AWS workload identity")
+	fs.String("control-plane.aws-service-account-id", "", "OpenAI service account ID for AWS workload identity")
 	fs.String("control-plane.client-cert", "", "Path to PEM client certificate for control-plane mTLS (format <path|env:VAR|file:/path>) (env.CONTROL_PLANE_CLIENT_CERT)")
 	fs.String("control-plane.client-key", "", "Path to PEM client private key for control-plane mTLS (format <path|env:VAR|file:/path>) (env.CONTROL_PLANE_CLIENT_KEY)")
 	fs.String("control-plane.http-proxy", "", "Outbound HTTP proxy for the control plane (format <url|env:VAR>)")
@@ -562,8 +684,11 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	fs.String("http-proxy", "", "Global outbound HTTP proxy (applies to control-plane, MCP, and Harpoon) (format <url|env:VAR>)")
 	fs.StringArray("mcp.server-url", nil, "Target MCP server URL (repeatable; format url=...,channel=...,unix-socket=...,http-proxy=...,client-cert=...,client-key=...) (env.MCP_SERVER_URL)")
 	fs.StringArray("mcp.command", nil, "Command to launch an MCP server over stdio (repeatable; format command=...,channel=...) (env.MCP_COMMAND)")
+	fs.String("mcp.stdio-failure-policy", string(StdioFailurePolicyRestart), "Recovery after an unexpected stdio child loss: restart internally or exit for an external supervisor (env.MCP_STDIO_FAILURE_POLICY)")
 	fs.Bool("mcp.stdio-send-initialized-notification", false, "Opt in to sending notifications/initialized after a successful stdio initialize response (env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION)")
 	fs.Bool("mcp.forward-trace-context", false, "Opt in to forwarding traceparent/tracestate through MCP params._meta over stdio and HTTP (env.MCP_FORWARD_TRACE_CONTEXT)")
+	fs.Bool("tracing.enabled", false, "Opt in to local request tracing (env.TRACING_ENABLED)")
+	fs.String("tracing.file", "", "New local JSONL trace file, required when tracing is enabled (env.TRACING_FILE)")
 	fs.String("mcp.http-proxy", "", "Outbound HTTP proxy for MCP (format <url|env:VAR>)")
 	fs.String("mcp.client-cert", "", "Path to PEM client certificate for MCP mTLS (format <path|env:VAR>) (env.MCP_CLIENT_CERT)")
 	fs.String("mcp.client-key", "", "Path to PEM client private key for MCP mTLS (format <path|env:VAR>) (env.MCP_CLIENT_KEY)")
@@ -673,6 +798,10 @@ func loadRuntimeFromFlagSet(fs *pflag.FlagSet, lookupEnv func(string) (string, b
 		return nil, nil, lookupEnv, err
 	}
 	lookupEnv = lookupEnvWithFileValues(lookupEnv, fileValues)
+	forwardRequestID, err := resolveRequestIDForwarding(fs, lookupEnv)
+	if err != nil {
+		return nil, nil, lookupEnv, err
+	}
 
 	tlsBundle, err := buildTLSBundle(fs, lookupEnv)
 	if err != nil {
@@ -690,10 +819,17 @@ func loadRuntimeFromFlagSet(fs *pflag.FlagSet, lookupEnv func(string) (string, b
 	if err != nil {
 		return nil, nil, lookupEnv, err
 	}
+	mcp.ForwardRequestID = forwardRequestID
 	logging, err := buildLoggingConfig(fs, lookupEnv)
 	if err != nil {
 		return nil, nil, lookupEnv, err
 	}
+	tracing, err := buildTracingConfig(fs, lookupEnv)
+	if err != nil {
+		return nil, nil, lookupEnv, err
+	}
+	controlPlane.TraceContextEnabled = tracing.Enabled
+	mcp.TraceContextEnabled = tracing.Enabled
 	health, err := buildHealthConfig(fs, lookupEnv)
 	if err != nil {
 		return nil, nil, lookupEnv, err
@@ -732,6 +868,7 @@ func loadRuntimeFromFlagSet(fs *pflag.FlagSet, lookupEnv func(string) (string, b
 	cfg := &Config{
 		ControlPlane: controlPlane,
 		Logging:      logging,
+		Tracing:      tracing,
 		Health:       health,
 		Process:      process,
 		MCP:          mcp,
@@ -1111,7 +1248,7 @@ func getControlPlaneAPIKey(flagValue string, lookupEnv func(string) (string, boo
 		return val, nil
 	}
 
-	return "", errMissingControlPlaneAPIKey
+	return "", nil
 }
 
 func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), globalProxy *url.URL, globalProxySource ProxySource) (ControlPlaneConfig, error) {
@@ -1261,11 +1398,14 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 		apiKeyFlagValue = flag.Value.String()
 	}
 
+	providerID := firstSet(getValue(fs, "control-plane.aws-identity-provider-id"), envOrDefault(lookupEnv, "CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID", ""))
+	serviceAccountID := firstSet(getValue(fs, "control-plane.aws-service-account-id"), envOrDefault(lookupEnv, "CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID", ""))
 	apiKey, err := getControlPlaneAPIKey(apiKeyFlagValue, lookupEnv)
 	if err != nil {
 		return ControlPlaneConfig{}, err
 	}
-	if err := ValidateControlPlaneAPIKey(apiKey); err != nil {
+	tokenProvider, err := controlPlaneTokenProvider(apiKey, providerID, serviceAccountID, baseURL)
+	if err != nil {
 		return ControlPlaneConfig{}, err
 	}
 
@@ -1285,6 +1425,7 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 		TunnelID:               types.TunnelID(tunnelID),
 		OrganizationID:         organizationID,
 		APIKey:                 apiKey,
+		TokenProvider:          tokenProvider,
 		MaxInFlightRequests:    maxInFlight,
 		PollTimeout:            pollTimeout,
 		InitialPollTimeout:     initialPollTimeout,
@@ -1859,6 +2000,33 @@ func resolveRequiredSecretReference(source, raw string, lookupEnv func(string) (
 	return value, nil
 }
 
+func parseStdioFailurePolicy(raw string) (StdioFailurePolicy, error) {
+	switch StdioFailurePolicy(raw) {
+	case StdioFailurePolicyRestart, StdioFailurePolicyExit:
+		return StdioFailurePolicy(raw), nil
+	default:
+		return "", errors.New("must be restart or exit")
+	}
+}
+
+func resolveStdioFailurePolicy(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) (StdioFailurePolicy, error) {
+	if flag := fs.Lookup("mcp.stdio-failure-policy"); flag != nil && flag.Changed {
+		policy, err := parseStdioFailurePolicy(flag.Value.String())
+		if err != nil {
+			return "", fmt.Errorf("invalid --mcp.stdio-failure-policy: %w", err)
+		}
+		return policy, nil
+	}
+	if raw, ok := lookupEnv("MCP_STDIO_FAILURE_POLICY"); ok && raw != "" {
+		policy, err := parseStdioFailurePolicy(raw)
+		if err != nil {
+			return "", fmt.Errorf("invalid MCP_STDIO_FAILURE_POLICY: %w", err)
+		}
+		return policy, nil
+	}
+	return StdioFailurePolicyRestart, nil
+}
+
 func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), globalProxy *url.URL, globalProxySource ProxySource, mainServerURL string) (MCPConfig, error) {
 	commandEntries, err := resolveMCPEntries(fs, lookupEnv, "mcp.command", "MCP_COMMAND")
 	if err != nil {
@@ -1925,6 +2093,10 @@ func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), gl
 		"mcp.stdio-send-initialized-notification",
 		"MCP_STDIO_SEND_INITIALIZED_NOTIFICATION",
 	)
+	if err != nil {
+		return MCPConfig{}, err
+	}
+	stdioFailurePolicy, err := resolveStdioFailurePolicy(fs, lookupEnv)
 	if err != nil {
 		return MCPConfig{}, err
 	}
@@ -2016,6 +2188,7 @@ func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), gl
 		ChannelBindings:                  bindings,
 		StartupWaitTimeout:               startupWaitTimeout,
 		StdioSendInitializedNotification: stdioSendInitializedNotification,
+		StdioFailurePolicy:               stdioFailurePolicy,
 		ForwardTraceContext:              forwardTraceContext,
 		ConnectionMaxTTL:                 ttl,
 		MaxConcurrentRequests:            maxConcurrent,

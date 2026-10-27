@@ -232,6 +232,16 @@ for path in sorted(root.rglob("*")):
     contents = path.read_bytes()
     if internal_module_path in contents:
         path.write_bytes(contents.replace(internal_module_path, canonical_module_path))
+
+# Keep the synthetic payload independent of a release-only source stamp.
+# version.go embeds VERSION, so linker flags alone do not stabilize its bytes.
+version_dir = root / "pkg" / "version"
+version_file = version_dir / "VERSION"
+if any(path.is_symlink() for path in (root / "pkg", version_dir, version_file)):
+    raise SystemExit("staged pkg/version/VERSION must not use symlinks")
+if not version_file.is_file():
+    raise SystemExit("staged pkg/version/VERSION must be a regular file")
+version_file.write_bytes(b"0.0.0-baseline\n")
 PY
 }
 

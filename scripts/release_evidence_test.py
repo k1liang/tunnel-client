@@ -42,7 +42,12 @@ def fail(message: str) -> None:
 def run(
     command: list[str], *, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True, env=env)
+    child_env = os.environ.copy() if env is None else env.copy()
+    # Child scripts resolve python3 by name; keep them on this test's interpreter.
+    child_env["PATH"] = os.pathsep.join(
+        (str(pathlib.Path(sys.executable).parent), child_env.get("PATH", os.defpath))
+    )
+    return subprocess.run(command, check=False, capture_output=True, text=True, env=child_env)
 
 
 def must_run(command: list[str], *, env: dict[str, str] | None = None) -> None:

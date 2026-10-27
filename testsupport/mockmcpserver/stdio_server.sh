@@ -3,6 +3,10 @@ set -euo pipefail
 
 initialized=0
 
+if [[ -n "${MOCK_MCP_STARTUP_PIPE:-}" ]]; then
+  printf '%s\n' "$$" > "$MOCK_MCP_STARTUP_PIPE"
+fi
+
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
 
@@ -71,6 +75,12 @@ while IFS= read -r line; do
       fi
       message="hello $name"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"structuredContent":{"message":"%s"}}}\n' "$id" "$message" "$message"
+      if [[ -n "${MOCK_MCP_EXIT_AFTER_RESPONSE_NAME:-}" && "$name" == "$MOCK_MCP_EXIT_AFTER_RESPONSE_NAME" ]]; then
+        if [[ -n "${MOCK_MCP_EXIT_GATE_PIPE:-}" ]]; then
+          IFS= read -r _ < "$MOCK_MCP_EXIT_GATE_PIPE"
+        fi
+        exit 0
+      fi
       ;;
   esac
 done

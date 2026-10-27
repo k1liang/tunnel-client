@@ -23,6 +23,7 @@ func TestCommandTraceContextIsOptionalAndTolerant(t *testing.T) {
 	}{
 		{"legacy missing", "", nil},
 		{"null", "null", nil},
+		{"oversized unknown field", `{"traceparent":"` + parent + `","unknown":"` + strings.Repeat("x", 1024) + `"}`, nil},
 		{"boolean", "false", nil},
 		{"array", "[]", nil},
 		{"wrong field type", `{"traceparent":false}`, nil},
@@ -43,6 +44,7 @@ func TestCommandTraceContextIsOptionalAndTolerant(t *testing.T) {
 			command, err := convertRawCommand(raw, time.Now())
 			require.NoError(t, err)
 			require.Equal(t, tc.want, command.TraceContext())
+			require.Equal(t, tc.want, command.CommandTraceContext())
 			if carrier := command.TraceContext(); carrier != nil {
 				carrier.Traceparent = "changed"
 				require.Equal(t, tc.want, command.TraceContext())
@@ -77,6 +79,9 @@ func TestCommandTraceContextRespectsRawHeaderOwnership(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(payload), &raw))
 			command, err := convertRawCommand(raw, time.Now())
 			require.NoError(t, err)
+			require.Equal(t, &types.TraceContext{Traceparent: parent}, command.CommandTraceContext())
+			command.CommandTraceContext().Traceparent = "changed"
+			require.Equal(t, parent, command.CommandTraceContext().Traceparent)
 			if tc.owned {
 				require.Nil(t, command.TraceContext())
 			} else {

@@ -156,7 +156,7 @@ func TestOAuthDiscoveryValidatesAfterRedirectCallback(t *testing.T) {
 		},
 	}
 	_, _, _, err := FetchOAuthMetadata(context.Background(), client, buildWellKnownCandidates(mustParseURL(t, "http://mcp.example")), nil)
-	require.ErrorContains(t, err, "origin is not trusted")
+	require.ErrorContains(t, err, "redirect blocked")
 	require.Equal(t, 1, calls)
 	require.Equal(t, 1, callbacks)
 }

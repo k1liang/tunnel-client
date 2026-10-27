@@ -309,8 +309,14 @@ func (m *MockMCPServer) Start(t testing.TB) {
 				return
 			}
 		}
-		if m.enableOAuth && req.URL.Path == wellKnownOAuthProtectedResourcePath {
-			m.serveProtectedResourceMetadata(w, req)
+		if req.URL.Path == wellKnownOAuthProtectedResourcePath || strings.HasPrefix(req.URL.Path, wellKnownOAuthProtectedResourcePath+"/") {
+			if m.enableOAuth && req.URL.Path == wellKnownOAuthProtectedResourcePath {
+				m.serveProtectedResourceMetadata(w, req)
+			} else {
+				// Unconfigured discovery endpoints are absent, rather than MCP
+				// routes that reject the metadata request's Accept header.
+				http.NotFound(w, req)
+			}
 			return
 		}
 		if req.Method == http.MethodPost {

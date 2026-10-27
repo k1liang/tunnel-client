@@ -13,8 +13,29 @@ type sharedConnectionTransport struct {
 	base                          mcp.Transport
 	preserveOnContextCancellation bool
 	restartOnInitialize           bool
+	generationProvider            interface{ Generation() uint64 }
 	mu                            sync.Mutex
 	conn                          *sharedConnection
+}
+
+// forwardingTransport installs this capture in Connect's context. It records
+// the generation of the exact shared connection returned through SDK wrappers
+// such as LoggingTransport, even if child loss races the return path.
+type physicalGenerationCaptureKey struct{}
+
+type physicalGenerationCapture struct {
+	generation uint64
+	known      bool
+}
+
+func captureSharedGeneration(ctx context.Context, conn *sharedConnection) {
+	if ctx == nil || conn == nil || !conn.generationKnown {
+		return
+	}
+	if capture, ok := ctx.Value(physicalGenerationCaptureKey{}).(*physicalGenerationCapture); ok && capture != nil {
+		capture.generation = conn.generation
+		capture.known = true
+	}
 }
 
 // NewSharedConnectionTransport returns a transport wrapper that reuses the
@@ -49,29 +70,52 @@ func newSharedConnectionTransport(base mcp.Transport) mcp.Transport {
 // uses this because all logical connections reuse the same child-process
 // stdin/stdout pipes.
 func newContextCancellationPreservingSharedConnectionTransport(base mcp.Transport) mcp.Transport {
-	return newSharedConnectionTransportWithPolicies(base, true, false)
+	transport := newSharedConnectionTransportWithPolicies(base, true, false)
+	if child, ok := base.(interface{ SetOnChildLost(func()) }); ok {
+		child.SetOnChildLost(transport.(*sharedConnectionTransport).invalidate)
+	}
+	return transport
 }
 
 func newSharedConnectionTransportWithPolicies(base mcp.Transport, preserveOnContextCancellation, restartOnInitialize bool) mcp.Transport {
 	if base == nil {
 		return nil
 	}
-	return &sharedConnectionTransport{
+	transport := &sharedConnectionTransport{
 		base:                          base,
 		preserveOnContextCancellation: preserveOnContextCancellation,
 		restartOnInitialize:           restartOnInitialize,
 	}
+	transport.generationProvider, _ = base.(interface{ Generation() uint64 })
+	return transport
 }
 
 func (t *sharedConnectionTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	if t == nil || t.base == nil {
 		return nil, nil
 	}
-	t.mu.Lock()
-	if t.conn != nil {
+	for {
+		t.mu.Lock()
+		if t.conn == nil {
+			break
+		}
 		conn := t.conn
+		if t.connectionCurrentLocked(conn) {
+			captureSharedGeneration(ctx, conn)
+			t.mu.Unlock()
+			return conn, nil
+		}
+		// Child loss advances the generation before its callback can acquire
+		// this mutex. Detach the stale connection here so a new call cannot
+		// borrow it during that callback gap.
+		base := conn.base
+		conn.base = nil
+		conn.hasWritten = false
+		t.conn = nil
 		t.mu.Unlock()
-		return conn, nil
+		if base != nil {
+			_ = base.Close()
+		}
 	}
 	conn, err := t.base.Connect(ctx)
 	if err != nil {
@@ -83,9 +127,41 @@ func (t *sharedConnectionTransport) Connect(ctx context.Context) (mcp.Connection
 		owner:                         t,
 		preserveOnContextCancellation: t.preserveOnContextCancellation,
 	}
+	if versioned, ok := conn.(interface{ physicalGeneration() (uint64, bool) }); ok {
+		sharedConn.generation, sharedConn.generationKnown = versioned.physicalGeneration()
+	}
 	t.conn = sharedConn
+	captureSharedGeneration(ctx, sharedConn)
 	t.mu.Unlock()
 	return sharedConn, nil
+}
+
+// Caller holds mu. The child supervisor invokes its loss callback only after
+// releasing its own lock, so this generation check does not invert locks.
+func (t *sharedConnectionTransport) connectionCurrentLocked(conn *sharedConnection) bool {
+	return t.generationProvider == nil || conn == nil || !conn.generationKnown || conn.generation == t.generationProvider.Generation()
+}
+
+// invalidate detaches the SDK connection for a lost child before a replacement
+// can be connected. Close runs outside the lock because it closes OS pipes and
+// may unblock readers that enter this transport again.
+func (t *sharedConnectionTransport) invalidate() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	conn := t.conn
+	var base mcp.Connection
+	if conn != nil {
+		base = conn.base
+		conn.base = nil
+		conn.hasWritten = false
+		t.conn = nil
+	}
+	t.mu.Unlock()
+	if base != nil {
+		_ = base.Close()
+	}
 }
 
 type sharedConnection struct {
@@ -93,6 +169,8 @@ type sharedConnection struct {
 	owner                         *sharedConnectionTransport
 	preserveOnContextCancellation bool
 	hasWritten                    bool
+	generation                    uint64
+	generationKnown               bool
 }
 
 func (c *sharedConnection) preserveConnectionOnContextCancellation() bool {
@@ -153,6 +231,9 @@ func (c *sharedConnection) currentBase() mcp.Connection {
 	}
 	c.owner.mu.Lock()
 	defer c.owner.mu.Unlock()
+	if !c.owner.connectionCurrentLocked(c) {
+		return nil
+	}
 	return c.base
 }
 

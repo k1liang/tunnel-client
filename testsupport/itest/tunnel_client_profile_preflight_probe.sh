@@ -10,6 +10,7 @@ fi
 client_path="$1"
 profile_file="$2"
 preflight_base_url="$3"
+http_request="${TUNNEL_CLIENT_PREFLIGHT_HTTP:?}"
 shift 3
 
 startup_timeout_seconds="${STARTUP_TIMEOUT_SECONDS:-120.0}"
@@ -18,7 +19,6 @@ client_pid=""
 tmpdir=""
 health_url_file=""
 health_unix_socket=""
-control_plane_socket_path="${TUNNEL_INTEGRATION_TUNNEL_SERVICE_SOCKET_PATH:-}"
 
 stop_client() {
   if [[ -n "$client_pid" ]] && kill -0 "$client_pid" 2>/dev/null; then
@@ -59,23 +59,17 @@ request_ok() {
   local timeout_seconds="$2"
   shift 2
 
-  local -a curl_args=(
-    --silent
-    --show-error
-    --output /dev/null
-    --write-out '%{http_code}'
-    --max-time "$timeout_seconds"
+  local -a request_args=(
+    --status-only
+    --timeout "$timeout_seconds"
   )
-  if [[ -n "$control_plane_socket_path" ]]; then
-    curl_args+=(--unix-socket "$control_plane_socket_path")
-  fi
   while (($# > 0)); do
-    curl_args+=(-H "$1")
+    request_args+=(--header "$1")
     shift
   done
 
   local status=""
-  status="$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)"
+  status="$("$http_request" "${request_args[@]}" "$url" 2>/dev/null || true)"
   [[ "$status" == 2* ]]
 }
 
@@ -85,24 +79,18 @@ request_json() {
   local payload="$3"
   shift 3
 
-  local -a curl_args=(
-    --silent
-    --show-error
-    --include
-    --max-time "$timeout_seconds"
-    --request POST
+  local -a request_args=(
+    --timeout "$timeout_seconds"
+    --method POST
     --header "Content-Type: application/json"
     --data "$payload"
   )
-  if [[ -n "$control_plane_socket_path" ]]; then
-    curl_args+=(--unix-socket "$control_plane_socket_path")
-  fi
   while (($# > 0)); do
-    curl_args+=(-H "$1")
+    request_args+=(--header "$1")
     shift
   done
 
-  curl "${curl_args[@]}" "$url" 2>/dev/null || true
+  "$http_request" "${request_args[@]}" "$url" 2>/dev/null || true
 }
 
 emit_http_snapshot() {
@@ -111,20 +99,14 @@ emit_http_snapshot() {
   shift 2
 
   log_event "http snapshot for $url"
-  local -a curl_args=(
-    --silent
-    --show-error
-    --include
-    --max-time "$timeout_seconds"
+  local -a request_args=(
+    --timeout "$timeout_seconds"
   )
-  if [[ -n "$control_plane_socket_path" ]]; then
-    curl_args+=(--unix-socket "$control_plane_socket_path")
-  fi
   while (($# > 0)); do
-    curl_args+=(-H "$1")
+    request_args+=(--header "$1")
     shift
   done
-  curl "${curl_args[@]}" "$url" >&2 || true
+  "$http_request" "${request_args[@]}" "$url" >&2 || true
 }
 
 emit_health_snapshot() {

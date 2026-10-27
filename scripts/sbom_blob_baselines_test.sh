@@ -35,6 +35,8 @@ runfiles_helper="$(bootstrap_resolve_runfile "${TUNNEL_CLIENT_SBOM_RUNFILES_RUNF
 source "${runfiles_helper}"
 
 sbom_require_bazel_test_runfiles
+test_python="$(sbom_resolve_runfile "${TUNNEL_CLIENT_PYTHON_RUNFILE:-}")"
+export PATH="$(dirname "$test_python"):$PATH"
 compliance_dir="${TEST_TMPDIR}/compliance"
 mkdir -p "${compliance_dir}"
 

@@ -101,6 +101,7 @@ func runOAuthMetadataDiscoveryPass(
 ) (*types.TunnelResponse, *url.URL, discoveryFailureType, error) {
 	var lastErr error
 	failureType := discoveryFailureTypeTimeoutOnly
+	var responseFailures discoveryResponseFailures
 	for i, candidate := range filtered {
 		urlForLog := tclog.RedactURL(candidate.URL)
 		attempts[i].Tried = true
@@ -116,11 +117,13 @@ func runOAuthMetadataDiscoveryPass(
 			)
 			attempts[i].Error = lastErr.Error()
 			failureType = discoveryFailureTypeNonTimeout
+			responseFailures.record(0, err, false)
 			continue
 		}
 		req = req.WithContext(headerscope.WithMCPDiscovery(req.Context()))
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", version.UserAgent)
+		applyForwardedRequestID(req)
 
 		var resp *http.Response
 		discoveryClient := withSameOriginRedirects(withTrustedDiscoveryOrigins(client, candidate.trustedOrigins), candidate.URL)
@@ -135,6 +138,7 @@ func runOAuthMetadataDiscoveryPass(
 				err,
 			)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(0, err, false)
 			if classifyDiscoveryFailure(err) == discoveryFailureTypeNonTimeout {
 				failureType = discoveryFailureTypeNonTimeout
 			}
@@ -150,6 +154,7 @@ func runOAuthMetadataDiscoveryPass(
 		if readErr != nil {
 			lastErr = fmt.Errorf("oauth discovery read %s: %w", urlForLog, readErr)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(resp.StatusCode, readErr, true)
 			if classifyDiscoveryFailure(readErr) == discoveryFailureTypeNonTimeout {
 				failureType = discoveryFailureTypeNonTimeout
 			}
@@ -159,7 +164,7 @@ func runOAuthMetadataDiscoveryPass(
 				}
 				continue
 			}
-			return nil, nil, failureType, lastErr
+			return nil, nil, responseFailures.classify(failureType), lastErr
 		}
 		failureType = discoveryFailureTypeNonTimeout
 		if len(body) > protectedResourceMetadataBodyLimitBytes {
@@ -169,25 +174,27 @@ func runOAuthMetadataDiscoveryPass(
 				protectedResourceMetadataBodyLimitBytes,
 			)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(resp.StatusCode, lastErr, false)
 			if (resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500) && i+1 < len(filtered) {
 				if logger != nil {
 					logger.DebugContext(ctx, "oauth discovery retrying after oversized body", slog.String("url", urlForLog), slog.Int("status", resp.StatusCode))
 				}
 				continue
 			}
-			return nil, nil, discoveryFailureTypeNotApplicable, lastErr
+			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
 		}
 
 		if len(body) == 0 {
 			lastErr = fmt.Errorf("oauth discovery empty body from %s (status %d)", urlForLog, resp.StatusCode)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(resp.StatusCode, lastErr, true)
 			if (resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500) && i+1 < len(filtered) {
 				if logger != nil {
 					logger.DebugContext(ctx, "oauth discovery retrying after empty body", slog.String("url", urlForLog), slog.Int("status", resp.StatusCode))
 				}
 				continue
 			}
-			return nil, nil, discoveryFailureTypeNotApplicable, lastErr
+			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
 		}
 
 		// Retry on known fallback-friendly statuses.
@@ -197,12 +204,14 @@ func runOAuthMetadataDiscoveryPass(
 			}
 			lastErr = fmt.Errorf("oauth discovery status %d from %s", resp.StatusCode, urlForLog)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(resp.StatusCode, lastErr, false)
 			continue
 		}
 
 		if err := validateProtectedResourceMetadata(body); err != nil {
 			lastErr = fmt.Errorf("oauth discovery invalid metadata from %s: %w", urlForLog, err)
 			attempts[i].Error = lastErr.Error()
+			responseFailures.record(resp.StatusCode, lastErr, true)
 			if resp.StatusCode >= 500 && i+1 < len(filtered) {
 				if logger != nil {
 					logger.DebugContext(ctx, "oauth discovery retrying after invalid metadata",
@@ -212,14 +221,14 @@ func runOAuthMetadataDiscoveryPass(
 				}
 				continue
 			}
-			return nil, nil, discoveryFailureTypeNotApplicable, lastErr
+			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
 		}
 
 		attempts[i].Selected = true
 		return types.NewOAuthDiscoveryResponse(types.DefaultChannel, body, resp.StatusCode, resp.Header), candidate.URL, discoveryFailureTypeNotApplicable, nil
 	}
 
-	return nil, nil, failureType, lastErr
+	return nil, nil, responseFailures.classify(failureType), lastErr
 }
 
 // withSameOriginRedirects returns a shallow client copy that preserves the
@@ -238,7 +247,16 @@ func withSameOriginRedirects(client *http.Client, origin *url.URL) *http.Client 
 			return fmt.Errorf("oauth discovery: redirect blocked: destination must use the discovery origin")
 		}
 		if priorPolicy != nil {
-			return priorPolicy(req, via)
+			if err := priorPolicy(req, via); err != nil {
+				return err
+			}
+			// A caller policy may mutate the redirect request before net/http
+			// sends it. Recheck so a copied automatic request ID cannot leave
+			// the selected discovery origin.
+			if !sameURLOrigin(req.URL, origin) {
+				return fmt.Errorf("oauth discovery: redirect blocked: destination must use the discovery origin")
+			}
+			return nil
 		}
 		if len(via) >= 10 {
 			return fmt.Errorf("oauth discovery: stopped after 10 redirects")

@@ -37,6 +37,17 @@ func TestHarpoonTemplatesRuntimeE2E(t *testing.T) {
 	}
 }
 
+func TestHarpoonLoopbackHTTPTemplateRuntimeE2E(t *testing.T) {
+	t.Parallel()
+
+	for _, subject := range runtimeSubjectsWithBinaries(t, runtimeFullSubject(), runtimeCustomerSubject()) {
+		t.Run(subject.name, func(t *testing.T) {
+			t.Parallel()
+			runHarpoonLoopbackHTTPTemplateRuntime(t, subject)
+		})
+	}
+}
+
 func TestHarpoonRichTargetDiscoveryRuntimeE2E(t *testing.T) {
 	t.Parallel()
 
@@ -720,6 +731,133 @@ func (r *templateRuntimeRecorder) snapshot() []templateRuntimeRequest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]templateRuntimeRequest(nil), r.requests...)
+}
+
+func runHarpoonLoopbackHTTPTemplateRuntime(t *testing.T, subject runtimeSubject) {
+	t.Helper()
+	const credential = "Bearer loopback-e2e-private-credential"
+	upstreamRequests := &templateRuntimeRecorder{}
+	redirectRequests := &templateRuntimeRecorder{}
+	proxyRequests := &templateRuntimeRecorder{}
+	redirectDestination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectRequests.record(r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(redirectDestination.Close)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.record(r)
+		if r.URL.Path == "/resource/redirect" {
+			w.Header().Set("Location", redirectDestination.URL)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		_, _ = w.Write([]byte("local-ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRequests.record(r)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	ready := make(chan struct{})
+	commands := []mocktunnelservice.CommandResponse{
+		templateRuntimeCommand(t, "loopback-list-targets", "tools/call", json.RawMessage(`{"name":"list_targets","arguments":{}}`), ready),
+		templateRuntimeCommand(t, "loopback-get", "tools/call", json.RawMessage(`{"name":"call_target","arguments":{"label":"local_resource","parameters":{"id":"one"}}}`), ready),
+		templateRuntimeCommand(t, "loopback-redirect", "tools/call", json.RawMessage(`{"name":"call_target","arguments":{"label":"local_resource","parameters":{"id":"redirect"}}}`), ready),
+	}
+	controlPlane := mocktunnelservice.NewMockTunnelService(
+		mocktunnelservice.WithAPIKey(runtimeArtifactAPIKey),
+		mocktunnelservice.WithTunnelID(runtimeArtifactTunnelID),
+		mocktunnelservice.WithCommandResponses(commands...),
+	)
+	controlPlane.Start(t)
+	profilePath := filepath.Join(t.TempDir(), "loopback-template.yaml")
+	healthURLFile := filepath.Join(t.TempDir(), "health.url")
+	profile := fmt.Sprintf(`config_version: 2
+control_plane:
+  base_url: %s
+  tunnel_id: %s
+  api_key: env:CONTROL_PLANE_API_KEY
+  poll_channels: [harpoon]
+harpoon:
+  targets:
+    - label: local_resource
+      template:
+        version: 1
+        origin: %s
+        allow_loopback_http: true
+        method: GET
+        path_template: /resource/{id}
+        parameters:
+          id:
+            type: string
+            required: true
+            pattern: '^[A-Za-z0-9_-]+$'
+            max_length: 64
+        headers:
+          Authorization: env:LOCAL_HTTP_AUTH
+        follow_redirects: false
+health:
+  listen_addr: 127.0.0.1:0
+  url_file: %s
+admin_ui:
+  open_browser: false
+`, runtimeArtifactYAMLScalar(controlPlane.BaseURL().String()), runtimeArtifactTunnelID,
+		runtimeArtifactYAMLScalar(upstream.URL), runtimeArtifactYAMLScalar(healthURLFile))
+	require.NoError(t, os.WriteFile(profilePath, []byte(profile), 0o600))
+	proc := startRuntimeArtifactWithEnv(t, subject.binary, map[string]string{
+		"LOCAL_HTTP_AUTH": credential, "HARPOON_HTTP_PROXY": proxyServer.URL,
+		"HARPOON_ALLOW_PLAINTEXT_HTTP": "false",
+	}, "run", "--config", profilePath)
+	_ = waitForRuntimeArtifactHealthURL(t, proc, healthURLFile)
+	if len(subject.startupSignals) > 0 {
+		waitForRuntimeArtifactOutput(t, proc, "completed startup", subject.startupSignals...)
+	}
+	close(ready)
+	waitForRuntimeArtifactIdle(t, proc, controlPlane)
+	require.NoErrorf(t, proc.stop(), "%s did not shut down cleanly; output:\n%s", subject.name, proc.output.String())
+
+	responses := controlPlane.ReceivedResponses(mocktunnelservice.ResponseMatchMatched)
+	require.Len(t, responses, len(commands))
+	require.Empty(t, controlPlane.ReceivedResponses(mocktunnelservice.ResponseMatchUnexpected))
+	byID := make(map[string]mocktunnelservice.ReceivedResponse, len(responses))
+	for _, response := range responses {
+		byID[response.RequestID] = response
+	}
+	discovery := templateRuntimeResult(t, byID["loopback-list-targets"])
+	discoveryJSON, err := json.Marshal(discovery)
+	require.NoError(t, err)
+	require.Contains(t, string(discoveryJSON), `"local_resource"`)
+	require.NotContains(t, string(discoveryJSON), upstream.URL)
+	require.NotContains(t, string(discoveryJSON), credential)
+	for _, tc := range []struct {
+		id         string
+		statusCode int
+	}{{"loopback-get", http.StatusOK}, {"loopback-redirect", http.StatusFound}} {
+		result := templateRuntimeResult(t, byID[tc.id])
+		structured, ok := result["structuredContent"].(map[string]any)
+		require.True(t, ok, "missing structured result for %s", tc.id)
+		require.Equal(t, float64(tc.statusCode), structured["status_code"])
+	}
+
+	requests := upstreamRequests.snapshot()
+	require.Len(t, requests, 2, "the loopback API must receive both template calls")
+	paths := make(map[string]bool, len(requests))
+	for _, request := range requests {
+		require.Equal(t, http.MethodGet, request.method)
+		require.Equal(t, credential, request.headers.Get("Authorization"))
+		paths[request.escapedPath] = true
+	}
+	require.True(t, paths["/resource/one"])
+	require.True(t, paths["/resource/redirect"])
+	if got := len(proxyRequests.snapshot()); got != 0 {
+		t.Fatalf("configured proxy received %d loopback template request(s)", got)
+	}
+	if got := len(redirectRequests.snapshot()); got != 0 {
+		t.Fatalf("redirect destination received %d request(s)", got)
+	}
+	require.NotContains(t, proc.output.String(), credential, "routine logs exposed the fixed credential")
 }
 
 func runHarpoonTemplatesRuntime(t *testing.T, subject runtimeSubject) {

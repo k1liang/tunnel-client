@@ -816,6 +816,54 @@ func TestStdioForwardingTransportAliasesRetiredResponseIDReuse(t *testing.T) {
 	require.Zero(t, baseConn.closeCalls.Load())
 }
 
+func TestStdioReplacementClearsWireStateAndIgnoresLateOldClose(t *testing.T) {
+	t.Parallel()
+
+	child := &versionedChildTransport{generation: 1}
+	shared := newContextCancellationPreservingSharedConnectionTransport(child)
+	base := NewForwardingTransport(&mcp.LoggingTransport{Transport: shared, Writer: io.Discard})
+	transport := NewStdioForwardingTransportWithOptions(base, StdioForwardingOptions{SendInitializedNotification: true})
+	serialized := transport.(*serializedForwardingTransport)
+	first, err := transport.Connect(context.Background())
+	require.NoError(t, err)
+	_, err = first.Write(context.Background(), nil, &jsonrpc.Request{Method: initializedNotificationMethod})
+	require.NoError(t, err)
+	requireLifecycleLockReleased(t, serialized)
+
+	serialized.markInitializeSucceeded()
+	serialized.markInitializationReady()
+	serialized.markInitializedNotificationSent()
+	id, err := jsonrpc.MakeID("retired-on-old-child")
+	require.NoError(t, err)
+	require.True(t, serialized.retireResponseID(id))
+	serialized.retiredMu.Lock()
+	serialized.nextAliasedID = 7
+	serialized.retiredMu.Unlock()
+
+	child.replace()
+	second, err := transport.Connect(context.Background())
+	require.NoError(t, err)
+	require.False(t, serialized.initializedNotificationSent())
+	require.True(t, serialized.rejectBeforeInitialization(&jsonrpc.Request{ID: id, Method: "tools/call"}, false))
+	require.False(t, serialized.hasRetiredResponseIDs())
+	serialized.retiredMu.Lock()
+	require.Zero(t, serialized.nextAliasedID)
+	serialized.retiredMu.Unlock()
+
+	result, err := second.Write(context.Background(), nil, &jsonrpc.Request{ID: id, Method: "tools/call"})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, result.StatusCode, "legacy caller must initialize the replacement child")
+	require.Empty(t, child.connections[1].writes, "request must not reach a child before initialization")
+
+	serialized.markInitializeSucceeded()
+	serialized.markInitializationReady()
+	serialized.markInitializedNotificationSent()
+	require.NoError(t, first.Close())
+	require.True(t, serialized.initializedNotificationSent(), "late old-generation cleanup must not clear replacement handshake")
+	require.False(t, serialized.rejectBeforeInitialization(&jsonrpc.Request{ID: id, Method: "tools/call"}, false))
+	require.NoError(t, second.Close())
+}
+
 func TestSerializedForwardingTransportRejectsRetiredResponseIDReuseWithoutStdioAliasing(t *testing.T) {
 	t.Parallel()
 

@@ -218,9 +218,13 @@ func startSingleClientLoadMCPServer(tb testing.TB) (string, *atomic.Int64) {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return server
 	}, nil)
-	httpServer := httptest.NewServer(handler)
+	// This fixture does not advertise OAuth. Keep well-known metadata requests
+	// outside the MCP handler so discovery observes an ordinary HTTP 404.
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", handler)
+	httpServer := httptest.NewServer(mux)
 	tb.Cleanup(httpServer.Close)
-	return httpServer.URL, &echoCalls
+	return httpServer.URL + "/mcp", &echoCalls
 }
 
 func (h *singleClientLoadHarness) initializeSession(ctx context.Context) (string, error) {

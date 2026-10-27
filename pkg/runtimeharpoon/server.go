@@ -93,17 +93,18 @@ var (
 
 // Server provides MCP tools for constrained HTTP access.
 type Server struct {
-	logger           *slog.Logger
-	registry         *Registry
-	cfg              *runtimeconfig.HarpoonConfig
-	httpTransport    http.RoundTripper
-	metrics          *serverMetrics
-	instructions     string
-	registrars       []ToolRegistrar
-	observers        []CallObserver
-	policyBindingKey []byte
-	unixMu           sync.Mutex
-	unixBySocket     map[string]http.RoundTripper
+	logger                    *slog.Logger
+	registry                  *Registry
+	cfg                       *runtimeconfig.HarpoonConfig
+	httpTransport             http.RoundTripper
+	loopbackTemplateTransport http.RoundTripper
+	metrics                   *serverMetrics
+	instructions              string
+	registrars                []ToolRegistrar
+	observers                 []CallObserver
+	policyBindingKey          []byte
+	unixMu                    sync.Mutex
+	unixBySocket              map[string]http.RoundTripper
 }
 
 type callTargetRequest struct {
@@ -250,16 +251,20 @@ func NewServer(cfg *runtimeconfig.HarpoonConfig, registry *Registry, logger *slo
 			return nil, errors.New("harpoon: initialize invocation binding")
 		}
 	}
+	// A separate transport prevents both environment and explicit Harpoon
+	// proxies from receiving local template requests or credentials.
+	loopbackTemplateTransport := &http.Transport{Proxy: nil}
 	return &Server{
-		logger:           logger.With(tclog.FieldComponent, tclog.ComponentHarpoon),
-		registry:         registry,
-		cfg:              cfg,
-		httpTransport:    serverOpts.httpTransport,
-		metrics:          serverMetrics,
-		instructions:     serverOpts.instructions,
-		registrars:       append([]ToolRegistrar(nil), serverOpts.registrars...),
-		observers:        append([]CallObserver(nil), serverOpts.observers...),
-		policyBindingKey: append([]byte(nil), serverOpts.policyBindingKey...),
+		logger:                    logger.With(tclog.FieldComponent, tclog.ComponentHarpoon),
+		registry:                  registry,
+		cfg:                       cfg,
+		httpTransport:             serverOpts.httpTransport,
+		loopbackTemplateTransport: loopbackTemplateTransport,
+		metrics:                   serverMetrics,
+		instructions:              serverOpts.instructions,
+		registrars:                append([]ToolRegistrar(nil), serverOpts.registrars...),
+		observers:                 append([]CallObserver(nil), serverOpts.observers...),
+		policyBindingKey:          append([]byte(nil), serverOpts.policyBindingKey...),
 	}, nil
 }
 
@@ -549,6 +554,7 @@ func (s *Server) callTarget(ctx context.Context, params callTargetRequest) (*cal
 		}
 	}
 	req.Header.Set("User-Agent", version.UserAgent)
+	req = req.WithContext(contextWithAutoRequestID(req.Context(), req.Header, resolved))
 	if droppedHeaderCount > 0 {
 		logger.InfoContext(ctx, "harpoon request dropped non-forwardable headers",
 			slog.String("label", label),
@@ -932,6 +938,7 @@ func (t targetRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
+	applyAutoRequestID(req, false)
 	return httpTransport.RoundTrip(req)
 }
 

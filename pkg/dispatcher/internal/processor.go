@@ -27,7 +27,9 @@ import (
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/oauth"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
+	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
+	"github.com/openai/tunnel-client/pkg/tracing"
 	"github.com/openai/tunnel-client/pkg/tunnelctx"
 	"github.com/openai/tunnel-client/pkg/types"
 )
@@ -208,6 +210,7 @@ type processorParams struct {
 	HostBus         hostbus.HostRegistrationBus `optional:"true"`
 	ControlPlaneCfg *runtimeconfig.ControlPlaneConfig
 	MeterProvider   *sdkmetric.MeterProvider
+	Tracing         *tracing.Runtime `optional:"true"`
 }
 
 type mcpProcessor struct {
@@ -216,6 +219,8 @@ type mcpProcessor struct {
 	tunnelResponder     controlplane.Responder
 	connectionMaxTTL    time.Duration
 	forwardTraceContext bool
+	forwardRequestID    runtimeconfig.RequestIDForwarding
+	tracing             *tracing.Runtime
 	metrics             *processorMetrics
 	tunnelID            types.TunnelID
 	oauthHTTPClient     *http.Client
@@ -236,6 +241,8 @@ type responsePostResult struct {
 // postTunnelResponse wraps Responder.PostResponse and preserves its request ID
 // even when the post fails.
 func (p *mcpProcessor) postTunnelResponse(ctx context.Context, requestID types.RequestID, response *types.TunnelResponse) responsePostResult {
+	ctx, finishTrace := p.startUploadTrace(ctx, response)
+	defer finishTrace()
 	tunnelServiceRequestID, err := p.tunnelResponder.PostResponse(ctx, requestID, response)
 	if err != nil {
 		recordWorkFailure(ctx, err, 0)
@@ -585,6 +592,8 @@ func NewProcessor(p processorParams) (Processor, error) {
 		tunnelResponder:     p.TunnelResponder,
 		connectionMaxTTL:    p.MCPConfig.ConnectionMaxTTL,
 		forwardTraceContext: forwardTraceContext,
+		forwardRequestID:    p.MCPConfig.ForwardRequestID,
+		tracing:             p.Tracing,
 		metrics:             processorMetrics,
 		tunnelID:            p.ControlPlaneCfg.TunnelID,
 		oauthHTTPClient:     p.OAuthHTTPClient,
@@ -604,6 +613,8 @@ func (p *mcpProcessor) Process(ctx context.Context, cmd controlplane.PolledComma
 	if cmd == nil {
 		return fmt.Errorf("dispatcher processor: nil command")
 	}
+	ctx, finishTrace := p.startCommandTrace(ctx, cmd)
+	defer func() { finishTrace(processErr) }()
 
 	requestID := cmd.RequestID()
 	ctx = tunnelctx.ContextWithRequestID(ctx, requestID.String())
@@ -778,6 +789,8 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	}
 
 	isNotification := !req.ID.IsValid()
+	ctx, finishTrace := p.startTargetTrace(ctx)
+	defer finishTrace()
 	if !isNotification {
 		ctx = tunnelctx.ContextWithRPCRequestID(ctx, req.ID)
 		logger = tclog.LoggerWithContextIdentifiers(ctx, p.logger)
@@ -786,6 +799,11 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	requestKindAttrs := requestKindAttributes(req)
 	requestKindAttrs = append(requestKindAttrs, attribute.String("channel", channel.String()))
 	latencyRecorded := &latencyFlags{}
+	if channel == types.ChannelHarpoon && p.forwardRequestID.AllowsHarpoon() {
+		if _, ok := tunnelctx.ControlPlaneCommandRequestIDFromContext(ctx); ok {
+			ctx = runtimeharpoon.ContextWithForwardRequestID(ctx)
+		}
+	}
 
 	// Establish MCP connection only for JSON-RPC commands.
 	conn, err := channelCfg.transport.Connect(ctx)
@@ -859,8 +877,15 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	}
 
 	headers := ensureDefaultAcceptHeader(cmd.Headers())
+	if channel != types.ChannelHarpoon &&
+		(channelCfg.transportKind == "" || channelCfg.transportKind == runtimeconfig.MCPTransportHTTPStreamable) &&
+		!p.forwardRequestID.AllowsMCP() {
+		headers.Del("X-Request-Id")
+	}
 	if p.forwardTraceContext && (channelCfg.transportKind == runtimeconfig.MCPTransportStdio || channelCfg.transportKind == runtimeconfig.MCPTransportHTTPStreamable) {
-		if provider, ok := cmd.(controlplane.TraceContextProvider); ok {
+		if p.tracing.Enabled() {
+			req = forwardTraceContext(req, nil, commandTraceCarrier(ctx))
+		} else if provider, ok := cmd.(controlplane.TraceContextProvider); ok {
 			req = forwardTraceContext(req, headers, provider.TraceContext())
 		}
 	}
@@ -879,6 +904,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	}
 	respHeader := writeResult.ResponseHeaders
 	if preserved := writeResult.PreservedError; preserved != nil {
+		markCommandTraceFailed(ctx)
 		encodedError := preserved.Payload()
 		respHeader = jsonRPCResponseHeaders(ctx, logger, respHeader)
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, statusCode, respHeader)
@@ -1014,7 +1040,11 @@ func (p *mcpProcessor) processSessionTerminationCommand(ctx context.Context, log
 		return fmt.Errorf("dispatcher processor: MCP transport does not support session termination")
 	}
 
-	statusCode, respHeader, err := terminator.TerminateSession(ctx, cloneHeaders(cmd.Headers()))
+	headers := cloneHeaders(cmd.Headers())
+	if !p.forwardRequestID.AllowsMCP() {
+		headers.Del("X-Request-Id")
+	}
+	statusCode, respHeader, err := terminator.TerminateSession(ctx, headers)
 	statusCode = normalizeTransportStatusCode(statusCode, err)
 	if err != nil || statusCode >= http.StatusBadRequest {
 		recordWorkFailure(ctx, err, statusCode)
@@ -1049,6 +1079,9 @@ func (p *mcpProcessor) processSessionTerminationCommand(ctx context.Context, log
 func (p *mcpProcessor) processOauthDiscoveryCommand(ctx context.Context, logger *slog.Logger, cmd controlplane.OauthDiscoveryCommand, channel types.Channel) error {
 	if p.mcpServerURL == nil {
 		return fmt.Errorf("dispatcher processor: missing MCP server URL")
+	}
+	if p.forwardRequestID.AllowsOAuth() {
+		ctx = oauth.ContextWithForwardRequestID(ctx, p.mcpServerURL)
 	}
 
 	candidates, _, err := oauth.BuildOAuthDiscoveryCandidates(ctx, p.oauthHTTPClient, p.mcpServerURL, logger, p.oauthOrigins...)
@@ -1286,6 +1319,9 @@ func (p *mcpProcessor) forwardResponses(ctx context.Context, conn mcpclient.Forw
 		// Shared stdio must survive response delivery failures as well as expiry:
 		// its released lifecycle slot may already be serving the next command.
 		mcpResponseReceived = true
+		if response.Error != nil {
+			markCommandTraceFailed(ctx)
+		}
 		finalResponse := true
 
 		// Ensure final JSON-RPC responses present as application/json to the control plane,

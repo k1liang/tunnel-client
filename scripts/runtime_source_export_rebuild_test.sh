@@ -94,6 +94,20 @@ if [[ -n "${TEST_SRCDIR:-}" && -n "${TEST_WORKSPACE:-}" ]]; then
 elif [[ -x "${script_dir}/scripts/build_runtime_source_export.sh" ]]; then
   script_dir="${script_dir}/scripts"
 fi
+if [[ -n "${BAZEL_TEST:-}" ]]; then
+  # shellcheck source=runtime_runfiles.sh
+  source "${script_dir}/runtime_runfiles.sh"
+  runtime_select_declared_python
+  # Expose the selected interpreter to exported scripts that invoke python3.
+  test_python_bin="${TEST_TMPDIR}/tunnel-client-python-bin"
+  mkdir -p "${test_python_bin}"
+  cat >"${test_python_bin}/python3" <<'SH'
+#!/bin/sh
+PYTHONHOME="${TUNNEL_CLIENT_RUNTIME_PYTHON_HOME}" exec "${TUNNEL_CLIENT_RUNTIME_PYTHON}" "$@"
+SH
+  chmod 0700 "${test_python_bin}/python3"
+  export PATH="${test_python_bin}:${PATH:-/usr/bin:/bin}"
+fi
 if [[ -n "${archive}" && "${archive}" != /* ]]; then
   if [[ -f "${archive}" ]]; then
     archive="$(cd "$(dirname "${archive}")" && pwd)/$(basename "${archive}")"

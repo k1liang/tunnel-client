@@ -79,7 +79,8 @@ func WithMeter(meter metric.Meter) ServerOption {
 	}
 }
 
-// WithHTTPTransport sets the HTTP transport used for Harpoon outbound calls.
+// WithHTTPTransport sets the transport for exact targets and HTTPS templates.
+// Opted-in loopback HTTP templates use a separate direct transport.
 func WithHTTPTransport(rt http.RoundTripper) ServerOption {
 	return func(o *serverOptions) {
 		if o == nil {

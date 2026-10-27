@@ -40,9 +40,12 @@ make release-tag VERSION=1.2.3
 ```
 
 Review and commit the source stamp, matching version assertions, and any
-affected SPDX baselines before publishing. `make release-tag` checks the source
-version and prints a tag name; it does not create or push a Git tag. Pushing
-that tag at the reviewed release commit starts the release workflow.
+affected SPDX baselines before publishing. Wait for the reviewed stable-source
+commit to reach public `master` and pass its validation. Check its
+`pkg/version/VERSION`, then create the tag at that exact public commit. Keep the
+next development-version change unmerged until this stable commit is tagged.
+`make release-tag` checks the source version and prints a tag name; it does not
+create or push a Git tag. Pushing that tag starts the release workflow.
 
 The release workflow validates the multi-architecture image on `master` and
 publishes it to `ghcr.io/openai/tunnel-client` for Linux `amd64` and `arm64`
@@ -103,19 +106,20 @@ reject prereleases.
 
 ### Post-release development version
 
-After verifying a stable release and completing its Homebrew handoff, prepare
-a reviewed source change for the next owner-selected development version, for
-example `1.2.4-dev` after `1.2.3`:
+The next owner-selected development-version change may be prepared and reviewed
+on a separate branch while the stable release is in progress. For example,
+prepare `1.2.4-dev` after stamping `1.2.3`:
 
 ```bash
 make release-source-version VERSION=1.2.4-dev
 ```
 
-Update the version-specific assertions and fixtures, regenerate affected SPDX
-baselines and hash metadata, and run the normal validation before merging the
-change. Verify the resulting source version and `master` checks. Keep the
-published stable tag, release assets, and Homebrew Formula tied to the stable
-release.
+Update the version-specific assertions and fixtures, regenerate SPDX baselines
+and hash metadata only when their synthetic payloads change, and run the normal
+validation. Do not merge this development change until the stable release,
+release notes, and Homebrew handoff have all been verified. Then verify the
+resulting source version and `master` checks. Keep the published stable tag,
+release assets, and Homebrew Formula tied to the stable release.
 
 This development reset changes `pkg/version/VERSION`; it does not require a Git
 development tag. A public `v1.2.4-dev` tag starts a separate prerelease through

@@ -2226,7 +2226,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional W3C context for client trace correlation. Foundation only: not emitted yet. Never forward to the customer MCP server unless the customer's local client configuration explicitly enables forwarding; default disabled. No baggage."
+            "description": "Optional W3C context for client trace correlation, emitted only when service tracing is enabled and the poll advertises trace-context-v1. Never forward to the customer MCP server unless the customer's local client configuration explicitly enables forwarding; default disabled. No baggage."
           }
         },
         "additionalProperties": true,

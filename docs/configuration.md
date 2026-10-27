@@ -172,6 +172,10 @@ Example:
 
 ```yaml
 config_version: 1
+# Optional. Forward the original HTTP X-Request-Id to MCP HTTP targets (default).
+# Use [mcp, harpoon, oauth] to opt in Harpoon REST and queued OAuth discovery
+# at the configured MCP origin, or none to disable automatic forwarding.
+forward_request_id: mcp
 control_plane:
   base_url: https://api.openai.com # citadel-ignore: public endpoint example for external tunnel-client config
   # Optional path appended before tunnel-client adds its /v1/... routes.
@@ -267,6 +271,26 @@ snapshot of argv, relevant environment variables, the startup YAML config file
 under `actual_config.contents` when present, and the effective startup config.
 API keys, bearer tokens, cookies, shard tokens, URL credentials, and URL query
 secrets are redacted before export.
+
+## AWS workload identity
+
+The tunnel client can use an AWS role to authenticate to the production control plane.
+Register the AWS issuer with OpenAI and map the role to a project service account
+with tunnel read and use access. Set both IDs on the client:
+
+```sh
+CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID=<provider-id>
+CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID=<service-account-id>
+```
+
+Leave static API key settings unset. The AWS SDK uses the configured region and
+credential chain, including ECS task credentials. The role needs
+`sts:GetWebIdentityToken` for audience `https://api.openai.com/v1` and a
+300-second assertion. The client exchanges that assertion at
+`https://auth.openai.com/oauth/token`. It keeps the access token in memory
+and refreshes it before expiry while serving `https://api.openai.com`.
+The same configuration is available under `control_plane.aws_identity_provider_id`
+and `control_plane.aws_service_account_id` in YAML.
 
 ## Commands
 
@@ -433,6 +457,13 @@ tunnel-client profiles add corp-proxy --sample sample_mcp_enterprise_proxy --tun
     parameters are serialized.
   - A Harpoon-only client may set only `harpoon` and omit the main MCP binding,
     but it must configure at least one routable Harpoon target.
+  - Unscoped polling and scopes that include `harpoon` wait for startup OAuth
+    discovery and target registration to complete. A failed startup catalog
+    prevents polling, and `/readyz` stays non-ready while registration is
+    pending or failed. Explicit scopes that exclude `harpoon` do not wait for
+    this catalog. This gate requires the standard runtime's acknowledged
+    registration bus; custom embedded graphs using a legacy publication-only
+    bus retain their existing behavior.
 - **Polled-command buffer capacity**
   - Flag: `--control-plane.max-inflight`
   - Env: `CONTROL_PLANE_MAX_INFLIGHT_REQUESTS`
@@ -456,6 +487,42 @@ tunnel-client profiles add corp-proxy --sample sample_mcp_enterprise_proxy --tun
     `X-Tunnel-Client-Wire-Protocol-Version`, `X-Tunnel-Client-Instance-Id`,
     and `X-Tunnel-MCP-Server-Info`) are managed by the client and cannot be
     overridden by extra headers.
+
+## Request ID forwarding
+
+`--forward-request-id` selects which outbound HTTP surfaces receive the
+original request's `X-Request-Id` automatically:
+
+- Flag: `--forward-request-id=mcp,harpoon`
+- Env: `FORWARD_REQUEST_ID=mcp,harpoon`
+- YAML: `forward_request_id: [mcp, harpoon]` (also accepts the scalar
+  `forward_request_id: mcp,harpoon`)
+- Default: `mcp`, preserving MCP Streamable HTTP request forwarding.
+
+The supported surfaces are `mcp` (MCP HTTP requests), `harpoon` (Harpoon
+`call_target` REST requests), `oauth` (queued OAuth discovery at the configured
+MCP origin), and `none` (disable automatic request ID forwarding). For example,
+`--forward-request-id=mcp,harpoon,oauth` enables all three named surfaces;
+`--forward-request-id=oauth` enables only eligible OAuth forwarding, and
+`--forward-request-id=none` disables automatic forwarding. An explicit value
+replaces the default rather than adding to it. Repeated names are deduplicated.
+Empty or unknown names, including `all`, and `none` combined with another name are
+rejected. Flags override the environment variable, which overrides YAML.
+
+Only an original inbound HTTP request ID is forwarded. The client never uses
+its queue command ID or JSON-RPC ID as a replacement, and it adds no header
+when the original ID is absent. Existing MCP header precedence and same-origin
+limits still apply. Harpoon's explicit caller or template headers retain
+ownership of `X-Request-Id`; automatic forwarding does not replace them or
+cross redirect trust boundaries. This setting does not change stdio, OAuth
+startup discovery requests, logging, or explicitly configured headers.
+
+With `oauth` selected, queued OAuth discovery may forward a present original
+inbound ID to the configured MCP server origin for its `WWW-Authenticate`
+probe, protected-resource metadata, and authorization-server metadata hosted
+there. Startup discovery has no inbound ID, and discovery at separate trusted
+origins receives none. This setting does not forward an ID for OAuth shim
+`call_target` requests. Existing same-origin redirect restrictions still apply.
 
 ## TLS trust (custom CA bundle)
 
@@ -536,12 +603,26 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
   - Required: yes for the `main` channel (unless `--mcp.server-url` supplies `main`)
   - Legacy form: `--mcp.command="npx -y @org/main-mcp"` (defaults to `main`)
   - Channel-qualified form: `--mcp.command="channel=bar,command=npx -y @org/bar-mcp"`
-  - Behavior: spawns the command once and uses the child process stdin/stdout for MCP frames
+  - Behavior: runs the command as a supervised child and uses its stdin/stdout for MCP frames
   - Deployment limit: multiple active `tunnel-client` instances sharing a
     tunnel ID with stdio bindings are **not supported**. See
     [stdio deployment limits](#stdio-deployment-limits).
   - Note: when using `MCP_COMMAND` with multiple entries, separate entries with
     newlines so semicolons remain part of the command.
+- **Stdio failure policy**
+  - Flag: `--mcp.stdio-failure-policy=restart|exit`
+  - Env: `MCP_STDIO_FAILURE_POLICY`
+  - YAML: `mcp.stdio_failure_policy`
+  - Default: `restart` in all three tunnel-client flavors.
+  - `restart` starts a replacement child after an unexpected exit, stdout EOF,
+    or stdin write failure. In-flight calls can fail; callers must initialize
+    the replacement child before retrying legacy calls.
+  - `exit` makes tunnel-client exit nonzero on those failures so an external
+    process supervisor can restart the whole client. An intentional client
+    shutdown does not trigger either recovery path.
+  - This setting applies to all stdio channel bindings in the instance and has
+    no effect on HTTP MCP bindings. Before downgrading to a client without it,
+    remove its YAML key and CLI flag; older clients reject unknown keys and flags.
 - **Automatic stdio initialization guard**
   - Each request selects its protocol lifecycle automatically; no configuration
     is required. This applies to stdio channels only.
@@ -549,8 +630,9 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
     before the shared child completes a successful `initialize` exchange and
     receives `notifications/initialized`. This prevents requests from reaching
     a stateful stdio server before it is ready.
-  - The caller owns initialization and recovery. The guard does not synthesize
-    `initialize`, replay rejected requests, or initialize a replacement child.
+  - The caller owns initialization and request retry after child recovery. The
+    guard does not synthesize `initialize`, replay rejected requests, or
+    initialize a replacement child.
     The notification shim below can supply `notifications/initialized` after
     the caller's successful `initialize` response.
   - The client reports rejected calls with `status_code: 409`, JSON-RPC code `-32002`, and
@@ -582,7 +664,8 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
   - When enabled, valid tunnel-supplied W3C `traceparent` and optional
     `tracestate` are forwarded through MCP request `params._meta` over stdio
     and Streamable HTTP. Existing caller trace fields in metadata or request
-    headers take precedence.
+    headers take precedence when local tracing is disabled. With local tracing
+    enabled, the separate metadata handoff described below applies.
     This option adds no baggage and does not inject HTTP headers.
   - The MCP server must consume request metadata to connect its traces.
     Instrumentation that reads only HTTP tracing headers may not consume it.
@@ -605,13 +688,17 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
   - Default: `0s` (disabled)
   - When positive for an HTTP-streamable `main` MCP binding, tunnel-client
     delays its first control-plane poll and OAuth discovery until the
-    MCP listener accepts a connection. It retries only pre-connect
-    `connection refused` and missing Unix-socket errors during this window;
-    any HTTP response, including `401 Unauthorized`, proves the listener is
-    reachable.
-  - If the wait expires, polling resumes for compatibility while `/readyz`
-    remains non-ready for the startup failure. This setting does not retry or
-    replay tunneled MCP commands.
+    MCP initialization probe completes. It retries pre-connect `connection
+    refused`, missing Unix-socket errors, and HTTP `429`/`5xx` during this
+    window. Authentication-required responses such as `401 Unauthorized`
+    complete the probe without retrying.
+  - Without this optional listener wait, HTTP `429`/`5xx` initialization
+    responses retry in the background with backoff capped at 30 seconds.
+    Readiness stays pending until the probe settles; other default probe
+    failure handling is unchanged.
+  - If the configured wait expires, `/readyz` remains non-ready. Polling still
+    requires successful startup catalog completion when Harpoon is included.
+    Initialization retries never replay tunneled MCP commands.
 - **Max concurrent requests**
   - Flag: `--mcp.max-concurrent-requests`
   - Env: `MCP_MAX_CONCURRENT_REQUESTS`
@@ -786,6 +873,31 @@ affinity; it does not implement routing affinity. The
 after a successful forwarded `initialize` response. It does not initialize
 every replica or make multiple stdio instances safe.
 
+By default, if a stdio child exits unexpectedly, closes stdout, or stops
+accepting stdin writes, `tunnel-client` starts a replacement child. Set
+`--mcp.stdio-failure-policy=exit` to exit nonzero and delegate recovery to an
+external process supervisor. An intentional client shutdown still exits
+successfully.
+
+### Stdio failure policy upgrade and rollback
+
+Deployments that rely on a process supervisor restarting the entire client
+should select `exit` when upgrading to a version with the `restart` default.
+Use `MCP_STDIO_FAILURE_POLICY=exit` while older and newer binaries may read the
+same deployment configuration; add the YAML key or CLI flag only after older
+binaries are no longer used. The `exit` policy remains supported throughout
+this rollout and rollback window. Removing it would require a separate,
+reviewed deprecation and migration plan.
+
+Upgrade one stdio tunnel at a time without overlapping active clients. Before
+promoting an upgraded deployment, verify that an unexpected child failure
+either starts a replacement child under `restart` or exits nonzero under
+`exit`. For `restart`, also verify that legacy callers can initialize the new
+child and complete a subsequent request; requests in flight during failure
+may fail and are not replayed. If that validation fails, select `exit` to
+restore whole-client supervision or roll back the binary. Remove the new YAML
+key or CLI flag before rolling back to a version that does not recognize it.
+
 ## Harpoon MCP (outbound HTTP allowlist)
 
 `harpoon` is an embedded MCP server that exposes an allowlisted, buffered HTTP
@@ -794,6 +906,16 @@ client with labeled targets.
 Harpoon's channel (`harpoon`) is enabled only when at least one target is
 registered. If there are no targets, `harpoon` commands return
 `unsupported_channel`.
+
+Startup OAuth discovery retries timeouts, HTTP `429`/`5xx`, and malformed
+successful metadata responses with jittered exponential backoff capped at
+30 seconds. This includes transient failures fetching advertised authorization
+server metadata, so polling does not begin with a partial discovered target
+catalog. Discovery and target registration must complete before an unscoped
+poller, or a poller whose scope includes Harpoon, consumes commands. Optional
+OAuth discovery on plain MCP servers may complete with an empty catalog;
+this does not enable the Harpoon channel. Permanent configuration and trust
+errors are not bypassed, and readiness remains non-ready while retrying.
 
 At startup, after configured targets and startup OAuth-discovered targets have
 been processed, tunnel-client emits one INFO log named
@@ -885,6 +1007,85 @@ later OAuth discovery commands or registry mutations.
   - Env: `HARPOON_HOSTS_INCLUDE_PRIVATE`
   - Default: `true`
   - Behavior: includes RFC1918 IPv4 plus IPv6 ULA (fc00::/7).
+
+## Local tracing
+
+Local tracing is disabled by default in every binary and the Go SDK. Configure
+`--tracing.enabled` / `TRACING_ENABLED` / `tracing.enabled` and
+`--tracing.file` / `TRACING_FILE` / `tracing.file`. Flags override environment,
+which overrides YAML; explicit `false` disables lower-precedence opt-ins.
+Supplying a file alone does not enable tracing. The SDK uses `Config.Tracing`
+and `Config.ForwardTraceContext`.
+
+```yaml
+tracing:
+  enabled: true
+  file: /private/new-trace.jsonl
+mcp:
+  forward_trace_context: true
+```
+
+The file must be a new regular file in an existing directory; existing files,
+symlinks, and special files are rejected. Files use mode `0600` on Unix and
+inherit the directory's access controls on Windows. Choose a new path each run.
+Remove these options before downgrading to a client that does not support them.
+
+Enabling tracing advertises `trace-context-v1`. The client accepts each command's
+validated v00 `traceparent` as its parent, never the poll connection's parent.
+Absent, invalid, or oversized context produces no local trace and leaves command
+execution unchanged. The original parent's sampled flag controls recording;
+the client never forces sampling or creates an unrelated root. Each request has
+fixed `tunnel.client.dispatch`, `tunnel.client.mcp`, and
+`tunnel.client.upload` spans. Each response POST attempt adds a
+`tunnel.client.upload_attempt` child of the upload span. Its elapsed time covers
+the HTTP request through the returned response or transport error; retry waits
+appear as gaps between attempt spans inside the upload span.
+With `mcp.forward_trace_context` enabled, the MCP span context is forwarded
+through `params._meta`, preserving caller-owned metadata trace fields. Existing
+Per-command forwarded HTTP headers remain byte-for-byte unchanged but do not
+suppress this separately opted-in metadata handoff. Operator-configured
+`mcp.extra_headers` containing `traceparent` or `tracestate` still suppress
+metadata forwarding, including with both options enabled or an empty header
+value. A metadata-aware target uses the MCP child; a
+header-only target retains the original HTTP parent. The target must
+extract that metadata to create its own execution span. Local tracing does not
+inject HTTP tracing headers or propagate baggage or incoming `tracestate`.
+
+JSONL contains `name`, `trace_id`, `span_id`, `parent_span_id`, `start_time`,
+`end_time`, and OpenTelemetry `status`. Attempt records additionally contain
+`attempt`, `elapsed_ms`, `outcome`, and `http_status` when an HTTP response was
+received. `outcome` is one of `accepted`, `already_fulfilled_or_unknown` (HTTP
+404), `http_error`, `timeout`, `canceled`, `network_error`, or `request_error`.
+The file excludes payloads, prompts, credentials, headers, raw errors,
+arbitrary attributes, resource fields, events, and exception descriptions.
+For example, inspect one run with:
+
+```sh
+jq -r 'select(.name == "tunnel.client.upload_attempt") | [.trace_id, .parent_span_id, .attempt, .elapsed_ms, (.http_status // "-"), .outcome] | @tsv' /private/new-trace.jsonl
+```
+
+This is a local JSONL export, not a collector or OTLP export. Attempt records
+require both opt-in local tracing and a valid sampled command parent, as above.
+An isolated tracing provider leaves the application's global provider unchanged.
+Export runs asynchronously with a 1024-record queue and a 64 MiB file limit.
+Queue saturation drops records instead of delaying responses. A write failure or
+file limit stops writes for that run; command execution continues. Shutdown
+drains after command workers stop, with at most one second of exporter waiting.
+A blocked operating-system write can retain the single writer until it returns.
+
+Privacy-safe counters under `tunnel_client_tracing_*` report commands, missing
+and invalid carriers, unsampled parents, exported records, dropped records, and
+export failures. Trace IDs are never metric labels. Compare complete-trace
+coverage and request latency, CPU, and memory with a flags-off baseline; stop a
+canary on unexpected missing parents, drops, export failures, or overhead.
+
+The client can ship with flags off before service support. Enabling complete
+traces requires the service's queue/poll carrier support and upstream request
+parent handoff to be deployed and validated first. Older services may ignore the
+capability and omit the carrier; those commands continue without local spans.
+Start with isolated synthetic traces, then a separately authorized small canary
+before expanding. Roll back by disabling `tracing.enabled` and
+`mcp.forward_trace_context`; retain compatible service support during rollback.
 
 ## Logging
 

@@ -401,6 +401,10 @@ func waitHealthStartup(t *testing.T, h *harnesspkg.Harness) {
 	if !oauth.IsOptionalDiscoveryFailure(result, probe, err) {
 		require.NoError(t, err)
 	}
+	// Discovery finishes before Harpoon acknowledges registration, including
+	// the empty startup catalog for stdio. Readiness requires both milestones.
+	require.NotNil(t, h.StartupCatalog)
+	require.NoError(t, h.StartupCatalog.Wait(ctx))
 }
 
 func healthTestClient(t *testing.T, urlFile string) (*http.Client, string) {
@@ -447,7 +451,7 @@ func assertLegacyHealthProbes(t *testing.T, client *http.Client, base string) {
 		body, err := io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, http.StatusOK, response.StatusCode, "%s: %s", path, body)
 		require.Equal(t, want, string(body))
 		require.Equal(t, "text/plain; charset=utf-8", response.Header.Get("Content-Type"))
 	}

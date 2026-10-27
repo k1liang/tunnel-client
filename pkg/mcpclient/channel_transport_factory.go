@@ -238,7 +238,7 @@ func (f *ChannelTransportFactory) httpClientForKey(key string, serverURL *url.UR
 			return client, nil
 		}
 		f.mu.Unlock()
-		transport, err := buildMcpHTTPTransport(f.logger, f.logging, f.meterProvider, f.tlsBundle, clientCertificate, unixSocketPath, proxyURL, serverURL, f.config.ExtraHeaders, f.config.DiscoveryExtraHeaders)
+		transport, err := buildMcpHTTPTransport(f.logger, f.logging, f.meterProvider, f.tlsBundle, clientCertificate, unixSocketPath, proxyURL, serverURL, f.config.ExtraHeaders, f.config.DiscoveryExtraHeaders, f.config.TraceContextEnabled)
 		if err != nil {
 			return nil, err
 		}

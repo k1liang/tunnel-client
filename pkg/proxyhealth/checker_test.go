@@ -162,6 +162,40 @@ func TestTemplateOnlyProxyHealthChecksOriginWithConnect(t *testing.T) {
 	}
 }
 
+func TestLoopbackTemplateProxyHealthStaysDirect(t *testing.T) {
+	t.Parallel()
+	for _, useRegistry := range []bool{true, false} {
+		t.Run(fmt.Sprintf("shared_registry_%t", useRegistry), func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.HarpoonConfig{
+				HTTPProxy: mustParseURL(t, "http://proxy.example:8080"), HTTPProxySource: config.ProxySource("flag"),
+				Targets: []config.HarpoonTarget{{Label: "local", Template: &runtimeconfig.HarpoonTargetTemplate{
+					Version: 1, Origin: "http://127.0.0.1:23373", AllowLoopbackHTTP: true, Method: http.MethodGet,
+					PathTemplate: "/resource/{id}", Parameters: map[string]runtimeconfig.HarpoonTemplateParameter{
+						"id": {Type: "string", Required: true, Pattern: "[A-Za-z0-9_-]+", MaxLength: 64},
+					},
+				}}},
+			}
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			var registry *harpoon.Registry
+			if useRegistry {
+				var err error
+				registry, err = harpoon.NewRegistry(logger, false, convertConfigTargets(cfg.Targets))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			routes, err := buildRoutes(nil, nil, cfg, registry, logger, lookupEnvMap(map[string]string{"HTTP_PROXY": "http://environment-proxy.example:8080"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(routes) != 1 || routes[0].RouteMode != proxy.RouteModeDirect || routes[0].ProxyURL != nil || routes[0].ProxySource != config.ProxySourceIgnored {
+				t.Fatalf("loopback template route must be direct: %#v", routes)
+			}
+		})
+	}
+}
+
 func TestTemplateProxyHealthRejectsInvalidFallbackPolicy(t *testing.T) {
 	t.Parallel()
 

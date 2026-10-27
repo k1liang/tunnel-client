@@ -21,6 +21,8 @@ import (
 	"github.com/openai/tunnel-client/pkg/proxy"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
+	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
+	"github.com/openai/tunnel-client/pkg/runtimehealth"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/types"
 )
@@ -31,6 +33,7 @@ var Module = fx.Module(
 	fx.Provide(newMetadataState, newTunnelServiceClient, newPoller, controlplane.NewPollHealth, controlplane.NewDeliveryHealth,
 		fx.Annotate(func(s *controlplane.PollHealth) healthstate.Component { return s }, fx.ResultTags(`group:"runtime_health_components"`)),
 		fx.Annotate(func(s *controlplane.DeliveryHealth) healthstate.Component { return s }, fx.ResultTags(`group:"runtime_health_components"`)),
+		fx.Annotate(newStartupCatalogReadinessGate, fx.ResultTags(`group:"runtime_readiness_gates"`)),
 	),
 	fx.Invoke(runMetadataFetch, runPoller),
 )
@@ -243,11 +246,14 @@ func newPoller(p pollerParams) (internal.Poller, error) {
 type runnerParams struct {
 	fx.In
 
-	Lifecycle     fx.Lifecycle
-	Logger        *slog.Logger
-	Poller        internal.Poller
-	MCPConfig     *runtimeconfig.MCPConfig `optional:"true"`
-	MCPProbeState *mcpclient.ProbeState    `optional:"true"`
+	Lifecycle      fx.Lifecycle
+	Logger         *slog.Logger
+	Poller         internal.Poller
+	MCPConfig      *runtimeconfig.MCPConfig          `optional:"true"`
+	MCPProbeState  *mcpclient.ProbeState             `optional:"true"`
+	ControlPlane   *runtimeconfig.ControlPlaneConfig `optional:"true"`
+	StartupCatalog *hostbus.StartupCatalogState      `optional:"true"`
+	HostBus        hostbus.HostRegistrationBus       `optional:"true"`
 }
 
 type metadataParams struct {
@@ -343,6 +349,9 @@ func runPoller(p runnerParams) error {
 				if !waitForMCPStartupBeforePolling(ctx, p.MCPConfig, p.MCPProbeState, logger) {
 					return
 				}
+				if !waitForStartupCatalogBeforePolling(ctx, p.ControlPlane, p.StartupCatalog, p.HostBus, logger) {
+					return
+				}
 				p.Poller.Run(ctx)
 			}()
 			return nil
@@ -360,6 +369,86 @@ func runPoller(p runnerParams) error {
 	})
 
 	return nil
+}
+
+// Unscoped pollers can consume Harpoon work as soon as their first poll starts.
+// Wait for discovery and target registration, including an acknowledged empty
+// catalog for non-OAuth deployments. A target count alone cannot distinguish a
+// complete catalog from static targets registered before OAuth discovery.
+func waitForStartupCatalogBeforePolling(
+	ctx context.Context,
+	controlPlane *runtimeconfig.ControlPlaneConfig,
+	catalog *hostbus.StartupCatalogState,
+	bus hostbus.HostRegistrationBus,
+	logger *slog.Logger,
+) bool {
+	if !requiresStartupCatalog(controlPlane, catalog, bus) {
+		return ctx.Err() == nil
+	}
+	logger.InfoContext(ctx, "waiting for startup catalog before first control-plane poll")
+	if err := catalog.Wait(ctx); err != nil {
+		if ctx.Err() == nil {
+			logger.ErrorContext(ctx, "startup catalog failed; control-plane polling disabled",
+				slog.String("error", tclog.ErrorForLog(err)),
+			)
+		}
+		return false
+	}
+	return ctx.Err() == nil
+}
+
+func requiresStartupCatalog(
+	controlPlane *runtimeconfig.ControlPlaneConfig,
+	catalog *hostbus.StartupCatalogState,
+	bus hostbus.HostRegistrationBus,
+) bool {
+	// Isolated/custom graphs without startup discovery retain their behavior.
+	if catalog == nil {
+		return false
+	}
+	// Legacy embedded publishers cannot acknowledge registration. The stricter
+	// startup boundary is additive; preserve those custom graphs' behavior.
+	if bus != nil && !hostbus.SupportsAcknowledgement(bus) {
+		return false
+	}
+	if controlPlane != nil && controlPlane.PollChannelsConfigured && !slices.Contains(controlPlane.PollChannels, types.ChannelHarpoon) {
+		return false
+	}
+	return true
+}
+
+type startupCatalogReadinessParams struct {
+	fx.In
+
+	ControlPlane   *runtimeconfig.ControlPlaneConfig `optional:"true"`
+	StartupCatalog *hostbus.StartupCatalogState      `optional:"true"`
+	HostBus        hostbus.HostRegistrationBus       `optional:"true"`
+}
+
+type startupCatalogReadinessGate struct {
+	catalog *hostbus.StartupCatalogState
+}
+
+func newStartupCatalogReadinessGate(p startupCatalogReadinessParams) runtimehealth.ReadinessGate {
+	gate := &startupCatalogReadinessGate{}
+	if requiresStartupCatalog(p.ControlPlane, p.StartupCatalog, p.HostBus) {
+		gate.catalog = p.StartupCatalog
+	}
+	return gate
+}
+
+func (g *startupCatalogReadinessGate) Readiness() (bool, string) {
+	if g.catalog == nil {
+		return true, ""
+	}
+	done, _, err := g.catalog.Snapshot()
+	if !done {
+		return false, "startup catalog pending"
+	}
+	if err != nil {
+		return false, "startup catalog failed"
+	}
+	return true, ""
 }
 
 // waitForMCPStartupBeforePolling preserves the legacy immediate-poll behavior

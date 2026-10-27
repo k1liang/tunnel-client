@@ -46,12 +46,19 @@ func (t *forwardingTransport) Connect(ctx context.Context) (ForwardingConnection
 	if t == nil || t.base == nil {
 		return nil, nil
 	}
-	conn, err := t.base.Connect(ctx)
+	capture := &physicalGenerationCapture{}
+	connectCtx := ctx
+	if ctx != nil {
+		connectCtx = context.WithValue(ctx, physicalGenerationCaptureKey{}, capture)
+	}
+	conn, err := t.base.Connect(connectCtx)
 	if err != nil {
 		return nil, err
 	}
 	return &forwardingConnection{
-		base: conn,
+		base:            conn,
+		generation:      capture.generation,
+		generationKnown: capture.known,
 	}, nil
 }
 
@@ -130,7 +137,16 @@ var _ ForwardingConnection = (*forwardingConnection)(nil)
 // forwardingConnection delegates all behavior to the internal connection
 // implementation while satisfying the public ForwardingConnection interface.
 type forwardingConnection struct {
-	base mcp.Connection
+	base            mcp.Connection
+	generation      uint64
+	generationKnown bool
+}
+
+func (c *forwardingConnection) physicalGeneration() (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	return c.generation, c.generationKnown
 }
 
 func (c *forwardingConnection) Close() error {

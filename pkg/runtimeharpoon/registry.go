@@ -45,6 +45,10 @@ type Target struct {
 // IsTemplate identifies operations that require parameters before dispatch.
 func (t Target) IsTemplate() bool { return t.template != nil || t.Template != nil }
 
+// IsLoopbackHTTPTemplate reports a compiled template authorized for direct
+// loopback HTTP. Uncompiled input does not satisfy this policy.
+func (t Target) IsLoopbackHTTPTemplate() bool { return t.template != nil && t.template.loopbackHTTP }
+
 // Registry stores allowed targets keyed by label.
 type Registry struct {
 	logger            *slog.Logger
@@ -173,7 +177,7 @@ func (r *Registry) RegisterTarget(target Target) error {
 	if target.BaseURL.Scheme == "" || target.BaseURL.Host == "" {
 		return fmt.Errorf("harpoon: target %q base URL must include scheme and host", label)
 	}
-	if !r.allowPlaintext && !isHTTPS(target.BaseURL) {
+	if !r.allowPlaintext && !isHTTPS(target.BaseURL) && (template == nil || !template.loopbackHTTP) {
 		return fmt.Errorf("harpoon: target %q base URL must use https", label)
 	}
 	escapedPath := target.BaseURL.EscapedPath()

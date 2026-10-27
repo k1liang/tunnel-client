@@ -126,7 +126,7 @@ func StartHostRegistration(p HostRegistrationParams) error {
 							// Capture while this single consumer still owns the
 							// registration boundary. No later bundle can be
 							// processed until the startup digest is immutable.
-							return p.DigestState.Capture(p.Registry, p.ControlPlane)
+							return p.DigestState.Capture(ctx, p.Registry, p.ControlPlane)
 						})
 					} else {
 						bundle.Acknowledge(err)

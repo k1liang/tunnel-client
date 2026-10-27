@@ -316,6 +316,7 @@ func TestBuildMcpHTTPTransportRejectsInvalidExtraHeaders(t *testing.T) {
 				mustParseURL(t, "https://example.invalid/mcp"),
 				tc.extraHeaders,
 				tc.discoveryHeaders,
+				false,
 			)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
@@ -338,6 +339,7 @@ func TestChannelHTTPClientScopesStaticAndForwardedAuthorizationHeaders(t *testin
 	factory := newTestChannelTransportFactory(t, serverURL, &config.LoggingConfig{HTTPRawUnsafe: false}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	factory.config.ExtraHeaders = map[string]string{
 		"Authorization": "Bearer static-runtime",
+		"X-Request-Id":  "configured-request-id",
 		"X-Static":      "runtime",
 		"X-Discovery":   "runtime",
 	}
@@ -357,6 +359,7 @@ func TestChannelHTTPClientScopesStaticAndForwardedAuthorizationHeaders(t *testin
 
 	runtimeCtx, _, err := internal.ContextWithHeaders(context.Background(), http.Header{
 		"Authorization": {"Bearer connector-request"},
+		"X-Request-Id":  {"original-request-id"},
 		"X-Connector":   {"forwarded"},
 	})
 	if err != nil {
@@ -366,6 +369,9 @@ func TestChannelHTTPClientScopesStaticAndForwardedAuthorizationHeaders(t *testin
 	runtimeHeaders := mustReceiveHeaders(t, seen)
 	if got := runtimeHeaders.Get("Authorization"); got != "Bearer connector-request" {
 		t.Fatalf("runtime Authorization = %q, want connector request value", got)
+	}
+	if got := runtimeHeaders.Get("X-Request-Id"); got != "original-request-id" {
+		t.Fatalf("runtime X-Request-Id = %q, want original request value", got)
 	}
 	if got := runtimeHeaders.Get("X-Static"); got != "runtime" {
 		t.Fatalf("runtime X-Static = %q, want runtime", got)
@@ -382,6 +388,9 @@ func TestChannelHTTPClientScopesStaticAndForwardedAuthorizationHeaders(t *testin
 	discoveryHeaders := mustReceiveHeaders(t, seen)
 	if got := discoveryHeaders.Get("Authorization"); got != "Bearer static-runtime" {
 		t.Fatalf("discovery Authorization = %q, want static runtime value", got)
+	}
+	if got := discoveryHeaders.Get("X-Request-Id"); got != "configured-request-id" {
+		t.Fatalf("discovery X-Request-Id = %q, want configured value", got)
 	}
 	if got := discoveryHeaders.Get("X-Discovery"); got != "discovery" {
 		t.Fatalf("discovery X-Discovery = %q, want discovery", got)
@@ -462,9 +471,9 @@ func TestRunStartupProbeMarksSuccess(t *testing.T) {
 		},
 	}
 
-	runStartupProbe(
+	runStartupProbeWithRetry(
 		context.Background(),
-		50*time.Millisecond,
+		startupProbeRetryOptions{probeTimeout: 50 * time.Millisecond},
 		func(context.Context) (probeSession, error) {
 			return session, nil
 		},
@@ -489,9 +498,9 @@ func TestRunStartupProbeMarksFailure(t *testing.T) {
 
 	state := NewProbeState()
 
-	runStartupProbe(
+	runStartupProbeWithRetry(
 		context.Background(),
-		50*time.Millisecond,
+		startupProbeRetryOptions{probeTimeout: 50 * time.Millisecond},
 		func(context.Context) (probeSession, error) {
 			return nil, errors.New("boom")
 		},
@@ -576,9 +585,9 @@ func TestRunStartupProbeMarksFailureWhenConnectHangs(t *testing.T) {
 	release := make(chan struct{})
 	session := newCloseSignalingProbeSession()
 
-	runStartupProbe(
+	runStartupProbeWithRetry(
 		context.Background(),
-		20*time.Millisecond,
+		startupProbeRetryOptions{probeTimeout: 20 * time.Millisecond},
 		func(context.Context) (probeSession, error) {
 			<-release
 			return session, nil
@@ -769,7 +778,102 @@ func TestRunStartupProbeWithRetryKeepsStatePendingUntilListenerReachable(t *test
 	}
 }
 
-func TestRunStartupProbeWithRetryDoesNotRetryHTTPResponse(t *testing.T) {
+func TestRunStartupProbeRetriesTransientHTTPUntilRecovery(t *testing.T) {
+	t.Parallel()
+
+	for _, statusCode := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			t.Parallel()
+			state := NewProbeState()
+			session := &fakeProbeSession{initResult: mcp.InitializeResult{ProtocolVersion: "2025-03-26"}}
+			var attempts int
+			var delays []time.Duration
+			runStartupProbeWithRetry(context.Background(), startupProbeRetryOptions{
+				probeTimeout: time.Second,
+				backoffMin:   time.Millisecond,
+				backoffMax:   2 * time.Millisecond,
+				wait: func(_ context.Context, delay time.Duration) error {
+					if state.IsDone() {
+						t.Error("transient HTTP failure settled probe before recovery")
+					}
+					delays = append(delays, delay)
+					return nil
+				},
+			}, func(context.Context) (probeSession, error) {
+				attempts++
+				if attempts <= 3 {
+					return nil, NewProbeHTTPStatusError(statusCode, errors.New("temporarily unavailable"))
+				}
+				return session, nil
+			}, nil, state)
+
+			_, err, done := state.Wait(time.Second)
+			if !done || err != nil || attempts != 4 || !session.closed {
+				t.Fatalf("recovered probe: done=%t err=%v attempts=%d session closed=%t", done, err, attempts, session.closed)
+			}
+			if len(delays) != 3 || delays[0] != time.Millisecond || delays[1] != 2*time.Millisecond || delays[2] != 2*time.Millisecond {
+				t.Fatalf("retry delays = %v, want [1ms 2ms 2ms]", delays)
+			}
+		})
+	}
+}
+
+func TestRunStartupProbeDefaultRetryStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := NewProbeState()
+	attempts := 0
+	runStartupProbeWithRetry(ctx, startupProbeRetryOptions{
+		probeTimeout: time.Second,
+		wait: func(ctx context.Context, _ time.Duration) error {
+			cancel()
+			return ctx.Err()
+		},
+	}, func(context.Context) (probeSession, error) {
+		attempts++
+		return nil, NewProbeHTTPStatusError(http.StatusServiceUnavailable, errors.New("temporarily unavailable"))
+	}, nil, state)
+	if state.IsDone() || attempts != 1 {
+		t.Fatalf("canceled retry: done=%t attempts=%d, want pending and one attempt", state.IsDone(), attempts)
+	}
+}
+
+func TestRunStartupProbeDefaultDoesNotRetryPermanentErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, probeErr := range []error{
+		NewProbeHTTPStatusError(http.StatusUnauthorized, syscall.ECONNREFUSED),
+		NewProbeHTTPStatusError(http.StatusForbidden, errors.New("forbidden")),
+		NewProbeHTTPStatusError(http.StatusBadRequest, errors.New("bad request")),
+		NewProbeHTTPStatusError(http.StatusOK, errors.New("invalid MCP response")),
+		syscall.ECONNREFUSED,
+		NewProbeTimeoutError(time.Second, context.DeadlineExceeded),
+	} {
+		t.Run(probeErr.Error(), func(t *testing.T) {
+			t.Parallel()
+			state := NewProbeState()
+			attempts := 0
+			runStartupProbeWithRetry(context.Background(), startupProbeRetryOptions{
+				probeTimeout: time.Second,
+				wait: func(context.Context, time.Duration) error {
+					t.Error("permanent error retried")
+					return context.Canceled
+				},
+			}, func(context.Context) (probeSession, error) {
+				attempts++
+				return nil, probeErr
+			}, nil, state)
+			_, err, done := state.Wait(time.Second)
+			if !done || !errors.Is(err, probeErr) || attempts != 1 {
+				t.Fatalf("terminal probe: done=%t err=%v attempts=%d", done, err, attempts)
+			}
+		})
+	}
+}
+
+func TestRunStartupProbeWithRetryDoesNotRetryAuthRequiredResponse(t *testing.T) {
 	t.Parallel()
 
 	state := NewProbeState()
@@ -899,8 +1003,13 @@ func TestIsRetryableStartupProbeError(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "http response wins over wrapped refusal",
+			name: "http server error",
 			err:  NewProbeHTTPStatusError(http.StatusServiceUnavailable, syscall.ECONNREFUSED),
+			want: true,
+		},
+		{
+			name: "auth required wins over wrapped refusal",
+			err:  NewProbeHTTPStatusError(http.StatusUnauthorized, syscall.ECONNREFUSED),
 			want: false,
 		},
 		{

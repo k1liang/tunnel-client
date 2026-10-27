@@ -27,18 +27,20 @@ type fileConfigValues struct {
 }
 
 type fileConfig struct {
-	ConfigVersion *int                   `yaml:"config_version"`
-	CABundle      *string                `yaml:"ca_bundle"`
-	HTTPProxy     *string                `yaml:"http_proxy"`
-	ControlPlane  fileControlPlaneConfig `yaml:"control_plane"`
-	Log           fileLogConfig          `yaml:"log"`
-	Health        fileHealthConfig       `yaml:"health"`
-	AdminUI       fileAdminUICompat      `yaml:"admin_ui"`
-	Process       fileProcessConfig      `yaml:"process"`
-	Cloudflared   fileCloudflaredConfig  `yaml:"cloudflared"`
-	MCP           fileMCPConfig          `yaml:"mcp"`
-	Harpoon       fileHarpoonConfig      `yaml:"harpoon"`
-	Proxy         fileProxyConfig        `yaml:"proxy"`
+	ConfigVersion    *int                   `yaml:"config_version"`
+	CABundle         *string                `yaml:"ca_bundle"`
+	HTTPProxy        *string                `yaml:"http_proxy"`
+	ForwardRequestID yaml.Node              `yaml:"forward_request_id"`
+	ControlPlane     fileControlPlaneConfig `yaml:"control_plane"`
+	Log              fileLogConfig          `yaml:"log"`
+	Tracing          fileTracingConfig      `yaml:"tracing"`
+	Health           fileHealthConfig       `yaml:"health"`
+	AdminUI          fileAdminUICompat      `yaml:"admin_ui"`
+	Process          fileProcessConfig      `yaml:"process"`
+	Cloudflared      fileCloudflaredConfig  `yaml:"cloudflared"`
+	MCP              fileMCPConfig          `yaml:"mcp"`
+	Harpoon          fileHarpoonConfig      `yaml:"harpoon"`
+	Proxy            fileProxyConfig        `yaml:"proxy"`
 }
 
 type fileControlPlaneConfig struct {
@@ -47,6 +49,8 @@ type fileControlPlaneConfig struct {
 	TunnelID              *string           `yaml:"tunnel_id"`
 	OrganizationID        *string           `yaml:"organization_id"`
 	APIKey                *string           `yaml:"api_key"`
+	AWSIdentityProviderID *string           `yaml:"aws_identity_provider_id"`
+	AWSServiceAccountID   *string           `yaml:"aws_service_account_id"`
 	ClientCert            *string           `yaml:"client_cert"`
 	ClientKey             *string           `yaml:"client_key"`
 	HTTPProxy             *string           `yaml:"http_proxy"`
@@ -62,6 +66,11 @@ type fileLogConfig struct {
 	Format        *string `yaml:"format"`
 	File          *string `yaml:"file"`
 	HTTPRawUnsafe *bool   `yaml:"http_raw_unsafe"`
+}
+
+type fileTracingConfig struct {
+	Enabled *bool   `yaml:"enabled"`
+	File    *string `yaml:"file"`
 }
 
 type fileHealthConfig struct {
@@ -101,6 +110,7 @@ type fileMCPConfig struct {
 	DiscoveryExtraHeaders            map[string]string  `yaml:"discovery_extra_headers"`
 	OAuthTrustedOrigins              []string           `yaml:"oauth_trusted_origins"`
 	StartupWaitTimeout               *string            `yaml:"startup_wait_timeout"`
+	StdioFailurePolicy               *string            `yaml:"stdio_failure_policy"`
 	StdioSendInitializedNotification *bool              `yaml:"stdio_send_initialized_notification"`
 	ForwardTraceContext              *bool              `yaml:"forward_trace_context"`
 	ConnectionMaxTTL                 *string            `yaml:"connection_max_ttl"`
@@ -180,6 +190,9 @@ func loadFileConfigValues(fs *pflag.FlagSet, lookupEnv func(string) (string, boo
 	}
 
 	selectedCfg := cfg
+	if configValueOverridden(fs, lookupEnv, "forward-request-id", "FORWARD_REQUEST_ID") {
+		selectedCfg.ForwardRequestID = yaml.Node{}
+	}
 	// Retain YAML targets as structured values. Serializing them through the
 	// legacy HARPOON_TARGETS list could discard a template's constraints or
 	// interpret delimiters inside URL and header values as new fields.
@@ -307,6 +320,27 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 
 	setString(env, "CA_BUNDLE", c.CABundle)
 	setString(env, "TUNNEL_CLIENT_HTTP_PROXY", c.HTTPProxy)
+	if c.ForwardRequestID.Kind != 0 {
+		var names []string
+		switch c.ForwardRequestID.Kind {
+		case yaml.ScalarNode:
+			if c.ForwardRequestID.Tag != "!!str" {
+				return nil, fmt.Errorf("forward_request_id must be a comma-separated string or list of surfaces")
+			}
+			names = []string{c.ForwardRequestID.Value}
+		case yaml.SequenceNode:
+			if err := c.ForwardRequestID.Decode(&names); err != nil {
+				return nil, fmt.Errorf("forward_request_id must be a list of surface names: %w", err)
+			}
+		default:
+			return nil, fmt.Errorf("forward_request_id must be a comma-separated string or list of surfaces")
+		}
+		raw := strings.Join(names, ",")
+		if _, err := parseRequestIDForwarding(raw); err != nil {
+			return nil, err
+		}
+		env["FORWARD_REQUEST_ID"] = raw
+	}
 
 	if err := setResolvedString(env, "CONTROL_PLANE_BASE_URL", "control_plane.base_url", c.ControlPlane.BaseURL, lookupEnv); err != nil {
 		return nil, err
@@ -315,6 +349,8 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 		return nil, err
 	}
 	setString(env, "CONTROL_PLANE_TUNNEL_ID", c.ControlPlane.TunnelID)
+	setString(env, "CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID", c.ControlPlane.AWSIdentityProviderID)
+	setString(env, "CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID", c.ControlPlane.AWSServiceAccountID)
 	setString(env, "CONTROL_PLANE_ORGANIZATION_ID", c.ControlPlane.OrganizationID)
 	setString(env, "CONTROL_PLANE_CLIENT_CERT", c.ControlPlane.ClientCert)
 	setString(env, "CONTROL_PLANE_CLIENT_KEY", c.ControlPlane.ClientKey)
@@ -344,6 +380,8 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 	setString(env, "LOG_FORMAT", c.Log.Format)
 	setString(env, "LOG_FILE", c.Log.File)
 	setBool(env, "LOG_HTTP_RAW_UNSAFE", c.Log.HTTPRawUnsafe)
+	setBool(env, "TRACING_ENABLED", c.Tracing.Enabled)
+	setString(env, "TRACING_FILE", c.Tracing.File)
 
 	if err := setResolvedString(env, "HEALTH_LISTEN_ADDR", "health.listen_addr", c.Health.ListenAddr, lookupEnv); err != nil {
 		return nil, err
@@ -401,6 +439,7 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 		env["MCP_OAUTH_TRUSTED_ORIGINS"] = strings.Join(c.MCP.OAuthTrustedOrigins, "\n")
 	}
 	setString(env, "MCP_STARTUP_WAIT_TIMEOUT", c.MCP.StartupWaitTimeout)
+	setString(env, "MCP_STDIO_FAILURE_POLICY", c.MCP.StdioFailurePolicy)
 	setBool(env, "MCP_STDIO_SEND_INITIALIZED_NOTIFICATION", c.MCP.StdioSendInitializedNotification)
 	setBool(env, "MCP_FORWARD_TRACE_CONTEXT", c.MCP.ForwardTraceContext)
 	setString(env, "MCP_CONNECTION_MAX_TTL", c.MCP.ConnectionMaxTTL)

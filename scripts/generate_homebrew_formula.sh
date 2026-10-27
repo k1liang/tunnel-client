@@ -136,10 +136,14 @@ class TunnelClient < Formula
   def install
     libexec.install "tunnel-client", "cloudflared", "cloudflared-manifest.json"
     bin.write_exec_script libexec/"tunnel-client"
+    generate_completions_from_executable(bin/"tunnel-client", "completion")
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/tunnel-client --version")
+    assert_match "tunnel-client", (bash_completion/"tunnel-client").read
+    assert_match "#compdef tunnel-client", (zsh_completion/"_tunnel-client").read
+    assert_match "complete -c tunnel-client", (fish_completion/"tunnel-client.fish").read
   end
 end
 EOF

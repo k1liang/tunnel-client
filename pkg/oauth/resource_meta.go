@@ -219,6 +219,7 @@ func tryWWWAuthenticateProbe(
 	req = req.WithContext(headerscope.WithMCPDiscovery(req.Context()))
 	req.Header.Set("User-Agent", version.UserAgent)
 	req.Header.Set("Accept", "application/json")
+	applyForwardedRequestID(req)
 
 	resp, err := withSameOriginRedirects(client, serverURL).Do(req)
 	if err != nil {

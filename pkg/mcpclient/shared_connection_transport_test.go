@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -268,6 +269,175 @@ func TestNewSharedConnectionTransportReconnectsAfterForwardingWriteError(t *test
 	require.NotNil(t, conn2)
 	require.NotSame(t, conn, conn2)
 	require.Equal(t, 2, base.connectCalls)
+}
+
+func TestStdioChildLossInvalidatesCachedSDKConnection(t *testing.T) {
+	t.Parallel()
+
+	child := &versionedChildTransport{generation: 1}
+	shared := newContextCancellationPreservingSharedConnectionTransport(child)
+	first, err := shared.Connect(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, 1, child.connectCalls)
+
+	child.replace()
+	require.EqualValues(t, 1, child.connections[0].closed)
+	require.ErrorIs(t, first.Write(context.Background(), &jsonrpc.Request{Method: "ping"}), io.ErrClosedPipe)
+
+	second, err := shared.Connect(context.Background())
+	require.NoError(t, err)
+	require.NotSame(t, first, second)
+	require.EqualValues(t, 2, child.connectCalls)
+	require.NoError(t, second.Write(context.Background(), &jsonrpc.Request{Method: "ping"}))
+	require.Empty(t, child.connections[0].writes, "old connection must never reach the replacement child")
+}
+
+func TestStdioGenerationRejectsCachedConnectionBeforeLossCallback(t *testing.T) {
+	t.Parallel()
+
+	child := &versionedChildTransport{generation: 1}
+	shared := newContextCancellationPreservingSharedConnectionTransport(child)
+	first, err := shared.Connect(context.Background())
+	require.NoError(t, err)
+
+	callback := child.loseBeforeCallback()
+	require.ErrorIs(t, first.Write(context.Background(), &jsonrpc.Request{Method: "ping"}), io.ErrClosedPipe)
+	_, err = shared.Connect(context.Background())
+	require.ErrorIs(t, err, errStdioChildRestarting)
+	require.EqualValues(t, 1, child.connectCalls, "a lost child must not be borrowed again")
+	require.EqualValues(t, 1, child.connections[0].closed)
+	require.Empty(t, child.connections[0].writes)
+
+	if callback != nil {
+		callback()
+	}
+	child.replacementReady()
+	second, err := shared.Connect(context.Background())
+	require.NoError(t, err)
+	require.NotSame(t, first, second)
+	require.NoError(t, second.Write(context.Background(), &jsonrpc.Request{Method: "ping"}))
+}
+
+func TestStdioGenerationPassesThroughRawLogging(t *testing.T) {
+	t.Parallel()
+
+	child := &versionedChildTransport{generation: 1}
+	shared := newContextCancellationPreservingSharedConnectionTransport(child)
+	forwarding := NewForwardingTransport(&mcp.LoggingTransport{Transport: shared, Writer: io.Discard})
+	first, err := forwarding.Connect(context.Background())
+	require.NoError(t, err)
+	firstGeneration, known := physicalGenerationOf(first)
+	require.True(t, known)
+	require.EqualValues(t, 1, firstGeneration)
+
+	child.replace()
+	second, err := forwarding.Connect(context.Background())
+	require.NoError(t, err)
+	secondGeneration, known := physicalGenerationOf(second)
+	require.True(t, known)
+	require.EqualValues(t, 3, secondGeneration)
+	require.NotEqual(t, firstGeneration, secondGeneration)
+}
+
+func TestStdioGenerationCaptureKeepsOldIdentityAcrossLossRace(t *testing.T) {
+	t.Parallel()
+
+	child := &versionedChildTransport{generation: 1}
+	shared := newContextCancellationPreservingSharedConnectionTransport(child)
+	transport := NewForwardingTransport(&afterConnectTransport{
+		base: shared,
+		after: func() {
+			child.replace()
+		},
+	})
+	conn, err := transport.Connect(context.Background())
+	require.NoError(t, err)
+	generation, known := physicalGenerationOf(conn)
+	require.True(t, known)
+	require.EqualValues(t, 1, generation, "loss after shared Connect must not relabel its old connection")
+	_, err = conn.Write(context.Background(), nil, &jsonrpc.Request{Method: "ping"})
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+}
+
+type afterConnectTransport struct {
+	base  mcp.Transport
+	after func()
+}
+
+func (t *afterConnectTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.base.Connect(ctx)
+	if t.after != nil {
+		t.after()
+	}
+	return conn, err
+}
+
+// versionedChildTransport models the stdio supervisor's generation and
+// child-loss callback without starting a process or sharing test fixtures.
+type versionedChildTransport struct {
+	mu           sync.Mutex
+	generation   uint64
+	down         bool
+	onChildLost  func()
+	connectCalls int
+	connections  []*closeTrackingConn
+}
+
+func (t *versionedChildTransport) Connect(context.Context) (mcp.Connection, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.down {
+		return nil, errStdioChildRestarting
+	}
+	conn := &closeTrackingConn{}
+	t.connections = append(t.connections, conn)
+	t.connectCalls++
+	return &versionedTestConnection{Connection: conn, generation: t.generation}, nil
+}
+
+type versionedTestConnection struct {
+	mcp.Connection
+	generation uint64
+}
+
+func (c *versionedTestConnection) physicalGeneration() (uint64, bool) {
+	return c.generation, true
+}
+
+func (t *versionedChildTransport) Generation() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.generation
+}
+
+func (t *versionedChildTransport) SetOnChildLost(callback func()) {
+	t.mu.Lock()
+	t.onChildLost = callback
+	t.mu.Unlock()
+}
+
+func (t *versionedChildTransport) replace() {
+	callback := t.loseBeforeCallback()
+	if callback != nil {
+		callback()
+	}
+	t.replacementReady()
+}
+
+func (t *versionedChildTransport) loseBeforeCallback() func() {
+	t.mu.Lock()
+	t.generation++ // loss
+	t.down = true
+	callback := t.onChildLost
+	t.mu.Unlock()
+	return callback
+}
+
+func (t *versionedChildTransport) replacementReady() {
+	t.mu.Lock()
+	t.generation++ // replacement
+	t.down = false
+	t.mu.Unlock()
 }
 
 type countingTransport struct {

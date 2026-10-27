@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -809,11 +810,11 @@ func TestOAuthDiscoveredHarpoonTargetsHandoverAcrossRedundantClientsE2E(t *testi
 	}
 }
 
-func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E(t *testing.T) {
+func TestOAuthDiscoveryMissKeepsSecondaryReplicaOutOfPollingE2E(t *testing.T) {
 	t.Parallel()
 
-	// Characterize the current proc-affinity boundary. Once dynamic Harpoon
-	// targets become replica-safe, this test should flip from rejection to success.
+	// A replica without its discovered catalog must leave queued OAuth work for
+	// the healthy replica, even when a static target makes Harpoon routable.
 	const (
 		customerHost = "redundant-mcp.internal.preproduction.smp.bigco-example.com"
 		idpIssuer    = "http://idp.bigco-example.com/oauth2/aus2jrb9zi4O8hseE0h8"
@@ -825,7 +826,7 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 	discoveryEnabled.Store(true)
 	var registrationCalls atomic.Int32
 	secondaryDiscoveryFailed := make(chan struct{}, 1)
-	secondaryReady := make(chan struct{})
+	commandReady := make(chan struct{})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -884,7 +885,7 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 			"headers": map[string]any{},
 		},
 	}, func(testing.TB, map[string]any) {})
-	callTargetCommand.DeliverAfter = secondaryReady
+	callTargetCommand.DeliverAfter = commandReady
 	callTargetCommand.ExpectedResponses[0].Assert = func(tb testing.TB, resp mocktunnelservice.ReceivedResponse) {
 		target := oauthDiscoveryE2ETarget(t, tb)
 		if resp.ResponseType != string(wiretypes.ResponsePayloadJSONRPC) {
@@ -895,10 +896,11 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 		}
 		var payload struct {
 			Result struct {
-				IsError bool `json:"isError"`
-				Content []struct {
-					Text string `json:"text"`
-				} `json:"content"`
+				IsError           bool `json:"isError"`
+				StructuredContent struct {
+					StatusCode int    `json:"status_code"`
+					BodyBase64 string `json:"body_base64"`
+				} `json:"structuredContent"`
 			} `json:"result"`
 			Error json.RawMessage `json:"error"`
 		}
@@ -908,19 +910,15 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 		if len(payload.Error) != 0 {
 			target.Fatalf("harpoon call returned JSON-RPC error: %s", payload.Error)
 		}
-		if !payload.Result.IsError {
-			target.Fatalf("dynamic OAuth target unexpectedly remained callable on the second client")
+		if payload.Result.IsError || payload.Result.StructuredContent.StatusCode != http.StatusOK {
+			target.Fatalf("healthy replica failed to call its dynamic OAuth target: %s", resp.JSONResponse)
 		}
-		var textParts []string
-		for _, content := range payload.Result.Content {
-			textParts = append(textParts, content.Text)
-		}
-		if !strings.Contains(strings.Join(textParts, "\n"), "unknown target") {
-			target.Fatalf("unexpected process-local target rejection: %v", textParts)
+		if got := payload.Result.StructuredContent.BodyBase64; got != base64.StdEncoding.EncodeToString([]byte(`{"registered":true}`)) {
+			target.Fatalf("registration response body = %q, want encoded fixture response", got)
 		}
 	}
 
-	var secondaryClient *harnesspkg.TunnelClient
+	var primaryClient, secondaryClient *harnesspkg.TunnelClient
 	h := harnesspkg.NewHarness(
 		t,
 		harnesspkg.WithPreserveClientURLs(),
@@ -961,26 +959,41 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 			if _, err := h.HarpoonRegistry.WaitForTarget(ctx, targetLabel); err != nil {
 				t.Fatalf("wait for primary dynamic OAuth target: %v", err)
 			}
+			primaryClient = h.PrimaryClient()
+			waitForActiveHarpoonPollers(t, h, primaryClient)
 			discoveryEnabled.Store(false)
-			primaryClient := h.PrimaryClient()
 			if err := primaryClient.PausePoller(ctx); err != nil {
 				t.Fatalf("pause primary poller: %v", err)
 			}
+			if err := waitForNoActiveHarpoonPollRequests(ctx, h, primaryClient); err != nil {
+				t.Fatalf("drain primary poller: %v", err)
+			}
 			secondaryClient = h.StartAdditionalClient(t)
-			waitForActiveHarpoonPollers(t, h, secondaryClient)
 			select {
 			case <-secondaryDiscoveryFailed:
 			case <-ctx.Done():
 				t.Fatal("second client did not attempt disabled OAuth discovery")
 			}
-			close(secondaryReady)
+			close(commandReady)
+			pollCtx, pollCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+			defer pollCancel()
+			if err := secondaryClient.WaitForPolls(pollCtx, 1); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("secondary replica polled without its OAuth catalog: %v", err)
+			}
+			if got := len(h.ControlPlane.DeliveredCommands()); got != 0 {
+				t.Fatalf("delivered OAuth commands while healthy replica was paused = %d, want 0", got)
+			}
+			primaryClient.UnpausePoller()
 		}),
 	)
 
 	h.ExecuteScenarious(t)
 
-	if got := registrationCalls.Load(); got != 0 {
-		t.Fatalf("dynamic registration endpoint calls = %d, want 0", got)
+	if got := registrationCalls.Load(); got != 1 {
+		t.Fatalf("dynamic registration endpoint calls = %d, want 1", got)
+	}
+	if got := secondaryClient.PollCount(); got != 0 {
+		t.Fatalf("secondary replica poll count = %d, want 0", got)
 	}
 	if got := len(h.ControlPlane.DeliveredCommands()); got != 1 {
 		t.Fatalf("delivered process-local OAuth commands = %d, want 1", got)
@@ -989,7 +1002,7 @@ func TestOAuthDiscoveredHarpoonTargetIsUnavailableAfterSecondaryDiscoveryMissE2E
 		t.Fatalf("matched process-local OAuth responses = %d, want 1", got)
 	}
 	assertHarpoonResponseAttribution(t, h.ControlPlane.ReceivedHTTPRequests(), map[string]int{
-		secondaryClient.Name(): 1,
+		primaryClient.Name(): 1,
 	})
 }
 

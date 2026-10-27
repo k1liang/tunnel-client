@@ -28,6 +28,63 @@ func templateTestConfig() *runtimeconfig.HarpoonTargetTemplate {
 	}
 }
 
+func TestTemplateLoopbackHTTPOriginOptIn(t *testing.T) {
+	t.Parallel()
+
+	for _, origin := range []string{
+		"http://127.0.0.1:23373", "http://127.42.0.8:23373", "http://[::1]:23373",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			t.Parallel()
+			cfg := templateTestConfig()
+			cfg.Origin, cfg.AllowLoopbackHTTP = origin, true
+			policy, err := CompileTargetTemplate(cfg)
+			require.NoError(t, err)
+			require.True(t, policy.loopbackHTTP)
+			rendered, err := policy.Render(map[string]any{"resourceId": "one"})
+			require.NoError(t, err)
+			require.Equal(t, origin+"/resource/one", rendered.String())
+			registry, err := NewRegistry(runtimeRegistryTestLogger(), false, []Target{{Label: "local", Template: cfg}})
+			require.NoError(t, err)
+			require.True(t, registry.Targets()[0].IsLoopbackHTTPTemplate())
+		})
+	}
+
+	for _, tc := range []struct {
+		name, origin string
+		optIn        bool
+	}{
+		{"default rejects HTTP", "http://127.0.0.1:23373", false},
+		{"HTTPS with opt-in", "https://inventory.example:8443", true},
+		{"DNS localhost", "http://localhost:23373", true},
+		{"remote IP", "http://192.168.1.10:23373", true},
+		{"wildcard IP", "http://0.0.0.0:23373", true},
+		{"missing port", "http://127.0.0.1", true},
+		{"zero port", "http://127.0.0.1:0", true},
+		{"invalid port", "http://127.0.0.1:65536", true},
+		{"credentials", "http://user:secret@127.0.0.1:23373", true},
+		{"path", "http://127.0.0.1:23373/private", true},
+		{"query", "http://127.0.0.1:23373?x=1", true},
+		{"fragment", "http://127.0.0.1:23373#x", true},
+		{"IPv6 zone", "http://[::1%25lo0]:23373", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := templateTestConfig()
+			cfg.Origin, cfg.AllowLoopbackHTTP = tc.origin, tc.optIn
+			_, err := CompileTargetTemplate(cfg)
+			require.Error(t, err)
+		})
+	}
+
+	cfg := templateTestConfig()
+	cfg.Origin = "http://127.0.0.1:23373"
+	_, err := NewRegistry(runtimeRegistryTestLogger(), true, []Target{{Label: "local", Template: cfg}})
+	require.Error(t, err, "the broad exact-target plaintext flag must not enable HTTP templates")
+	_, err = NewRegistry(runtimeRegistryTestLogger(), false, []Target{{Label: "local", BaseURL: runtimeRegistryTestURL(t, cfg.Origin)}})
+	require.Error(t, err, "the template opt-in must not enable plaintext exact targets")
+}
+
 func TestTemplateRenderIntendedOperation(t *testing.T) {
 	t.Parallel()
 

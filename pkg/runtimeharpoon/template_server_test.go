@@ -8,7 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,6 +304,57 @@ func TestTemplateArgumentDecoderStrictContract(t *testing.T) {
 type templateServerTransport func(*http.Request) (*http.Response, error)
 
 func (f templateServerTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestLoopbackTemplateBypassesExplicitProxyAndDoesNotFollowRedirect(t *testing.T) {
+	const credential = "Bearer local-secret"
+	var upstreamCalls, proxyCalls, redirectedCalls atomic.Int32
+	redirected := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirectedCalls.Add(1)
+	}))
+	t.Cleanup(redirected.Close)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.Header.Get("Authorization") != credential || r.Method != http.MethodGet {
+			t.Errorf("unexpected upstream request method or authorization")
+		}
+		if r.URL.Path == "/resource/redirect" {
+			w.Header().Set("Location", redirected.URL)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		if r.URL.Path != "/resource/one" {
+			t.Errorf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyCalls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(proxy.Close)
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+	cfg := templateTestConfig()
+	cfg.Origin, cfg.AllowLoopbackHTTP = upstream.URL, true
+	cfg.Headers = map[string]string{"Authorization": credential}
+	logger := runtimeRegistryTestLogger()
+	registry, err := NewRegistry(logger, false, []Target{{Label: "local", Template: cfg}})
+	require.NoError(t, err)
+	server, err := NewServer(&runtimeconfig.HarpoonConfig{}, registry, logger,
+		WithHTTPTransport(&http.Transport{Proxy: http.ProxyURL(proxyURL)}))
+	require.NoError(t, err)
+	for _, id := range []string{"one", "redirect"} {
+		result, err := server.callTemplateHandler(context.Background(), &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+			Name: callTargetTool, Arguments: json.RawMessage(`{"label":"local","parameters":{"resourceId":"` + id + `"}}`),
+		}})
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+	}
+	require.EqualValues(t, 2, upstreamCalls.Load())
+	require.Zero(t, proxyCalls.Load(), "the proxy must never receive the fixed credential")
+	require.Zero(t, redirectedCalls.Load(), "redirects must remain disabled")
+}
 
 func TestTemplateHandlerPrivacyAndBounds(t *testing.T) {
 	t.Parallel()

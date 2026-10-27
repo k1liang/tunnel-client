@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
@@ -41,6 +42,7 @@ type TargetTemplate struct {
 	method             string
 	bodyPolicy         *compiledTemplateBodyPolicy
 	origin             url.URL
+	loopbackHTTP       bool
 	path               []templatePart
 	query              map[string]templatePart
 	parameters         map[string]compiledTemplateParameter
@@ -79,7 +81,7 @@ func CompileTargetTemplate(cfg *runtimeconfig.HarpoonTargetTemplate) (*TargetTem
 	if cfg.FollowRedirects {
 		return nil, errors.New("template redirects must be disabled")
 	}
-	origin, err := compileTemplateOrigin(cfg.Origin)
+	origin, err := compileTemplateOrigin(cfg.Origin, cfg.AllowLoopbackHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -87,12 +89,13 @@ func CompileTargetTemplate(cfg *runtimeconfig.HarpoonTargetTemplate) (*TargetTem
 		return nil, fmt.Errorf("template must declare 1 to %d parameters", maxTemplateParameters)
 	}
 	t := &TargetTemplate{
-		method:     cfg.Method,
-		bodyPolicy: bodyPolicy,
-		origin:     *origin,
-		query:      make(map[string]templatePart, len(cfg.Query)),
-		parameters: make(map[string]compiledTemplateParameter, len(cfg.Parameters)),
-		headers:    make(http.Header),
+		method:       cfg.Method,
+		bodyPolicy:   bodyPolicy,
+		origin:       *origin,
+		loopbackHTTP: cfg.AllowLoopbackHTTP,
+		query:        make(map[string]templatePart, len(cfg.Query)),
+		parameters:   make(map[string]compiledTemplateParameter, len(cfg.Parameters)),
+		headers:      make(http.Header),
 	}
 	for name, schema := range cfg.Parameters {
 		if !templateNamePattern.MatchString(name) {
@@ -220,25 +223,27 @@ func (t *TargetTemplate) computePolicyDigest() (string, error) {
 	// order and string-allowlist digest. Config export has a different purpose:
 	// it must retain alias spelling, which must never affect policy identity.
 	policy := struct {
-		Version         int                                               `json:"version"`
-		Origin          string                                            `json:"origin"`
-		Method          string                                            `json:"method"`
-		BodyPolicy      *runtimeconfig.HarpoonTemplateBodyPolicy          `json:"body_policy,omitempty"`
-		PathTemplate    string                                            `json:"path_template"`
-		Query           map[string]string                                 `json:"query,omitempty"`
-		Parameters      map[string]runtimeconfig.HarpoonTemplateParameter `json:"parameters"`
-		Headers         map[string]string                                 `json:"headers,omitempty"`
-		AllowedHeaders  []string                                          `json:"allowed_headers,omitempty"`
-		FollowRedirects bool                                              `json:"follow_redirects"`
-		HeaderRules     []runtimeconfig.HarpoonHeaderRule                 `json:"header_rules,omitempty"`
+		Version           int                                               `json:"version"`
+		Origin            string                                            `json:"origin"`
+		AllowLoopbackHTTP bool                                              `json:"allow_loopback_http,omitempty"`
+		Method            string                                            `json:"method"`
+		BodyPolicy        *runtimeconfig.HarpoonTemplateBodyPolicy          `json:"body_policy,omitempty"`
+		PathTemplate      string                                            `json:"path_template"`
+		Query             map[string]string                                 `json:"query,omitempty"`
+		Parameters        map[string]runtimeconfig.HarpoonTemplateParameter `json:"parameters"`
+		Headers           map[string]string                                 `json:"headers,omitempty"`
+		AllowedHeaders    []string                                          `json:"allowed_headers,omitempty"`
+		FollowRedirects   bool                                              `json:"follow_redirects"`
+		HeaderRules       []runtimeconfig.HarpoonHeaderRule                 `json:"header_rules,omitempty"`
 	}{
-		Version:    1,
-		Origin:     t.origin.String(),
-		Method:     t.method,
-		BodyPolicy: t.bodyPolicy.canonicalPolicy(),
-		Query:      make(map[string]string, len(t.query)),
-		Parameters: t.PublicParameters(),
-		Headers:    make(map[string]string, len(t.headers)),
+		Version:           1,
+		Origin:            t.origin.String(),
+		AllowLoopbackHTTP: t.loopbackHTTP,
+		Method:            t.method,
+		BodyPolicy:        t.bodyPolicy.canonicalPolicy(),
+		Query:             make(map[string]string, len(t.query)),
+		Parameters:        t.PublicParameters(),
+		Headers:           make(map[string]string, len(t.headers)),
 	}
 	parts := make([]string, len(t.path))
 	for i, part := range t.path {
@@ -275,13 +280,21 @@ func (t *TargetTemplate) computePolicyDigest() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func compileTemplateOrigin(raw string) (*url.URL, error) {
+func compileTemplateOrigin(raw string, allowLoopbackHTTP bool) (*url.URL, error) {
 	if len(raw) == 0 || len(raw) > maxTemplateURLBytes || strings.ContainsAny(raw, "{}\\%#") || !validTemplateText(raw) {
-		return nil, errors.New("invalid template HTTPS origin")
+		return nil, errors.New("invalid template origin")
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.Path != "" && u.Path != "/" {
-		return nil, errors.New("template origin must contain only an HTTPS scheme, host, and optional port")
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.Path != "" && u.Path != "/" {
+		return nil, errors.New("template origin must contain only a scheme, host, and optional port")
+	}
+	if allowLoopbackHTTP {
+		addr, err := netip.ParseAddr(u.Hostname())
+		if u.Scheme != "http" || err != nil || !addr.IsLoopback() || addr.Zone() != "" || u.Port() == "" {
+			return nil, errors.New("allow_loopback_http requires an HTTP origin with a literal loopback IP and fixed port")
+		}
+	} else if u.Scheme != "https" {
+		return nil, errors.New("template origin must use HTTPS unless allow_loopback_http is enabled")
 	}
 	if strings.HasSuffix(u.Host, ":") {
 		return nil, errors.New("invalid template origin port")

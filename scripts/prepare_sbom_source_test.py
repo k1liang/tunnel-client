@@ -11,9 +11,9 @@ import unittest
 SCRIPT = pathlib.Path(__file__).with_name("prepare_sbom_source.py")
 LEGACY = "github.com/openai/tunnel-client"
 CANONICAL = "github.com/openai/tunnel-client"
-CLOUDFLARED_COMMIT = "733bfb939963e150dcf5c4faddb1603f744fbc98"
+CLOUDFLARED_COMMIT = "002a5ccaf75a4e612bfa451063c1d82a2d13336b"
 CLOUDFLARED_MODULE_PATH = "github.com/cloudflare/cloudflared"
-CLOUDFLARED_MODULE_VERSION = "v0.0.0-20260814112252-733bfb939963"
+CLOUDFLARED_MODULE_VERSION = "v0.0.0-20261020083048-002a5ccaf75a"
 
 
 class PrepareSbomSourceTest(unittest.TestCase):
@@ -46,6 +46,10 @@ class PrepareSbomSourceTest(unittest.TestCase):
                 f'import "{LEGACY}/pkg/version"\n',
                 encoding="utf-8",
             )
+            version_dir = source_root / "pkg" / "version"
+            version_dir.mkdir(parents=True)
+            staged_version = version_dir / "VERSION"
+            staged_version.write_text("0.0.18-dev\n", encoding="utf-8")
 
             result = self.run_script(
                 root,
@@ -65,6 +69,46 @@ class PrepareSbomSourceTest(unittest.TestCase):
             )
             self.assertIn(CANONICAL, source_file.read_text(encoding="utf-8"))
             self.assertNotIn(LEGACY, source_file.read_text(encoding="utf-8"))
+            self.assertEqual(staged_version.read_bytes(), b"0.0.0-baseline\n")
+
+            staged_version.write_text("0.0.18\n", encoding="utf-8")
+            result = self.run_script(
+                root,
+                "canonicalize",
+                "--source-root",
+                str(source_root),
+                "--legacy-module-path",
+                LEGACY,
+                "--canonical-module-path",
+                CANONICAL,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(staged_version.read_bytes(), b"0.0.0-baseline\n")
+
+    def test_rejects_staged_version_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = pathlib.Path(temporary_directory)
+            source_root = root / "source"
+            version_dir = source_root / "pkg" / "version"
+            version_dir.mkdir(parents=True)
+            outside_version = root / "outside-version"
+            outside_version.write_text("0.0.18-dev\n", encoding="utf-8")
+            (version_dir / "VERSION").symlink_to(outside_version)
+
+            result = self.run_script(
+                root,
+                "canonicalize",
+                "--source-root",
+                str(source_root),
+                "--legacy-module-path",
+                LEGACY,
+                "--canonical-module-path",
+                CANONICAL,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not use symlinks", result.stderr)
+            self.assertEqual(outside_version.read_text(encoding="utf-8"), "0.0.18-dev\n")
 
     def test_prints_cloudflared_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -79,8 +123,8 @@ class PrepareSbomSourceTest(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "version": "2026.8.2",
-                        "build_time": "2026-08-14T11:22:52Z",
+                        "version": "2026.10.2",
+                        "build_time": "2026-10-20T09:17:30Z",
                         "release_commit": CLOUDFLARED_COMMIT,
                         "module_path": CLOUDFLARED_MODULE_PATH,
                         "package_path": f"{CLOUDFLARED_MODULE_PATH}/cmd/cloudflared",
@@ -103,9 +147,9 @@ class PrepareSbomSourceTest(unittest.TestCase):
             self.assertEqual(
                 result.stdout,
                 (
-                    "2026.8.2\t2026-08-14T11:22:52Z\t"
+                    "2026.10.2\t2026-10-20T09:17:30Z\t"
                     "github.com/cloudflare/cloudflared\t"
-                    "v0.0.0-20260814112252-733bfb939963\n"
+                    "v0.0.0-20261020083048-002a5ccaf75a\n"
                 ),
             )
 
@@ -123,7 +167,7 @@ class PrepareSbomSourceTest(unittest.TestCase):
             ),
             (
                 "module_version",
-                {"module_version": "v0.0.0-20260814112252-000000000000"},
+                {"module_version": "v0.0.0-20261020083048-000000000000"},
                 "module_version",
             ),
         )
@@ -137,8 +181,8 @@ class PrepareSbomSourceTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 manifest_data = {
-                    "version": "2026.8.2",
-                    "build_time": "2026-08-14T11:22:52Z",
+                    "version": "2026.10.2",
+                    "build_time": "2026-10-20T09:17:30Z",
                     "release_commit": CLOUDFLARED_COMMIT,
                     "module_path": CLOUDFLARED_MODULE_PATH,
                     "package_path": f"{CLOUDFLARED_MODULE_PATH}/cmd/cloudflared",

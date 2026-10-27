@@ -85,6 +85,7 @@ var (
 		"MCP_MAX_CONCURRENT_REQUESTS",
 		"MCP_SERVER_URL",
 		"MCP_STARTUP_WAIT_TIMEOUT",
+		"MCP_STDIO_FAILURE_POLICY",
 		"MCP_STDIO_SEND_INITIALIZED_NOTIFICATION",
 		"OPENAI_API_KEY",
 		"PID_FILE",
@@ -773,6 +774,7 @@ func TestFullAndRuntimeFlavorsSharedEnvironmentParity(t *testing.T) {
 				"MCP_EXTRA_HEADERS":                       "X-MCP: mcp",
 				"MCP_DISCOVERY_EXTRA_HEADERS":             "X-Discovery: discovery",
 				"MCP_STARTUP_WAIT_TIMEOUT":                "2s",
+				"MCP_STDIO_FAILURE_POLICY":                "exit",
 				"MCP_STDIO_SEND_INITIALIZED_NOTIFICATION": "true",
 				"MCP_FORWARD_TRACE_CONTEXT":               "true",
 				"MCP_CONNECTION_MAX_TTL":                  "30s",
@@ -1273,6 +1275,7 @@ func runtimeCoreFromFull(cfg *Config) runtimeconfig.Config {
 	return runtimeconfig.Config{
 		ControlPlane: cfg.ControlPlane,
 		Logging:      cfg.Logging,
+		Tracing:      cfg.Tracing,
 		Health:       cfg.Health,
 		Process:      cfg.Process,
 		MCP:          cfg.MCP,

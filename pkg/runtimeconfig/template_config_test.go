@@ -88,6 +88,38 @@ func TestLoadTemplateConfigPreservesStructuredPolicyAcrossFlavors(t *testing.T) 
 	}
 }
 
+func TestLoadLoopbackHTTPTemplateOptInAcrossFlavors(t *testing.T) {
+	t.Parallel()
+	contents := strings.Replace(templateConfigFixture,
+		"origin: https://private.example.invalid",
+		"origin: http://127.0.0.1:23373\n        allow_loopback_http: true", 1)
+	for _, flavor := range []Flavor{FlavorRuntime, FlavorRuntimeCloudflared, FlavorFull} {
+		t.Run(string(flavor), func(t *testing.T) {
+			t.Parallel()
+			cfg, err := Load([]string{"--config", writeRuntimeConfig(t, contents)}, flavor, lookupEnvMap(map[string]string{
+				"TEST_API_KEY": testAPIKey, "TEST_TEMPLATE_AUTH": "Bearer secret",
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Harpoon.AllowPlaintextHTTP || !cfg.Harpoon.Targets[0].Template.AllowLoopbackHTTP {
+				t.Fatal("loopback template opt-in must be independent of the broad plaintext target flag")
+			}
+			encoded, err := json.Marshal(cfg.Harpoon.Targets[0].Template)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored HarpoonTargetTemplate
+			if err := json.Unmarshal(encoded, &restored); err != nil {
+				t.Fatal(err)
+			}
+			if !restored.AllowLoopbackHTTP || restored.Origin != "http://127.0.0.1:23373" {
+				t.Fatal("JSON policy export lost the loopback HTTP opt-in")
+			}
+		})
+	}
+}
+
 func TestLoadTemplateParameterMetadataAcrossFlavors(t *testing.T) {
 	t.Parallel()
 	contents := strings.Replace(templateConfigFixture, "            required: true\n", "            required: true\n            description: Case identifier from the profile response\n            examples: [CASE-123, CASE-456]\n", 1)

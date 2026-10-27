@@ -63,6 +63,10 @@ type AuthServerMetadataFetchResult struct {
 	IssuerURL   string                      `json:"issuer_url,omitempty"`
 	SelectedURL string                      `json:"selected_url,omitempty"`
 	Attempts    []AuthServerMetadataAttempt `json:"attempts,omitempty"`
+
+	// Startup discovery uses this classification without changing the public
+	// diagnostics or best-effort behavior of ordinary metadata enrichment.
+	failureType discoveryFailureType
 }
 
 type authServerWellKnownPathSpec struct {
@@ -131,12 +135,13 @@ func FetchAuthServerMetadataWithResult(
 
 	if failureType == discoveryFailureTypeTimeoutOnly {
 		result.Attempts = result.Attempts[:0]
-		meta, errs, _ = runFetchAuthServerMetadataPass(ctx, client, issuerURL, candidates, result, discoveryRetryModeTimeoutBackoff)
+		meta, errs, failureType = runFetchAuthServerMetadataPass(ctx, client, issuerURL, candidates, result, discoveryRetryModeTimeoutBackoff)
 		if meta != nil {
 			return meta, result, nil
 		}
 	}
 
+	result.failureType = failureType
 	return nil, result, fmt.Errorf(
 		"oauth auth-server metadata fetch failed for issuer %q: %w",
 		tclog.RedactURLString(issuerURL),
@@ -154,6 +159,7 @@ func runFetchAuthServerMetadataPass(
 ) (*AuthServerMetadata, []error, discoveryFailureType) {
 	var errs []error
 	failureType := discoveryFailureTypeTimeoutOnly
+	var responseFailures discoveryResponseFailures
 	var fallbackMeta *AuthServerMetadata
 	fallbackAttemptIndex := -1
 	fallbackSelectedURL := ""
@@ -174,6 +180,7 @@ func runFetchAuthServerMetadataPass(
 			attempt.BodyText = response.BodyText
 		}
 		if err != nil {
+			responseFailures.record(attempt.StatusCode, err, true)
 			attempt.Error = tclog.ErrorForLog(err)
 			result.Attempts = append(result.Attempts, attempt)
 			errs = append(errs, wrapErrorWithRedactedMessage(
@@ -212,7 +219,7 @@ func runFetchAuthServerMetadataPass(
 		return fallbackMeta, errs, discoveryFailureTypeNotApplicable
 	}
 
-	return nil, errs, failureType
+	return nil, errs, responseFailures.classify(failureType)
 }
 
 func buildAuthServerMetadataCandidateURLs(issuerURL string) ([]authServerMetadataCandidate, error) {
@@ -279,6 +286,7 @@ func fetchAuthServerMetadataDocument(
 	if err != nil {
 		return nil, nil, err
 	}
+	applyForwardedRequestID(req)
 	redirectOrigin, err := url.Parse(metadataURL)
 	if err != nil {
 		return nil, nil, err

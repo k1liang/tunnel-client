@@ -70,11 +70,18 @@ X-Tunnel-Client-Version: 1.2.3
 `X-Tunnel-Client-Capabilities` describes features implemented by the tunnel
 client itself. Send it on all control-plane requests: tunnel metadata, managed
 Cloudflare runtime, polling, and command responses or notifications. The
-official client currently advertises one capability:
+official client always advertises its routing capability:
 
 ```http
 X-Tunnel-Client-Capabilities: wrong-cluster-v1
 ```
+
+With local tracing explicitly enabled it additionally advertises
+`trace-context-v1` on the same requests. This signals support for an optional
+per-command `trace_context` returned by a compatible service. The service may
+omit it; presence on one command does not authorize inferring support or a
+parent for later commands. Clients with tracing disabled preserve the existing
+capability declaration and older services may ignore the additional token.
 
 This is a common, extensible set of capability names, not a header dedicated to
 routing. A client advertises only behavior it implements. Features that use
@@ -688,6 +695,22 @@ It preserves existing customer trace fields and adds no baggage. This works
 over stdio and Streamable HTTP; HTTP instrumentation that reads only headers
 does not see the MCP metadata. Missing or malformed context leaves the original
 operation unchanged. Trace identifiers are never metric labels.
+
+With [local tracing](configuration.md#local-tracing) enabled, the client creates
+dispatch, MCP, response-upload, and per-response-POST-attempt spans from the
+command's validated v00 `traceparent`. The poll request's parent is never
+substituted. No local spans
+are recorded for absent, invalid, oversized, or unsampled carriers. Incoming
+`tracestate` and baggage are discarded by local tracing. When metadata forwarding
+is also enabled, the MCP span context is added only to absent metadata trace
+fields. Existing caller-owned metadata and HTTP header values are never replaced;
+Per-command forwarded HTTP header presence does not suppress this separately
+opted-in MCP metadata handoff. Operator-configured MCP trace headers continue to
+suppress metadata forwarding with either tracing setting. Without local tracing,
+forwarding retains its existing header-ownership
+rule. New client code may
+ship with flags off before service support, but complete traces require deployed
+and validated upstream parent handoff and service queue/poll carrier support.
 
 ## Errors, retries, and concurrency
 

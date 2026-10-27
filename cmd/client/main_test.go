@@ -439,7 +439,9 @@ func TestAppBindsHealthBeforeCloudflaredReadiness(t *testing.T) {
 	require.NoError(t, readErr)
 	require.NoError(t, closeErr)
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	require.Contains(t, string(readyBody), "cloudflared startup pending")
+	// Fx readiness gates are unordered. Catalog registration can also remain
+	// pending while the cloudflared hook blocks the remaining startup hooks.
+	require.Contains(t, []string{"cloudflared startup pending", "startup catalog pending"}, strings.TrimSpace(string(readyBody)))
 	requireAppLivenessMetric(t, client, baseURL)
 
 	require.NoError(t, os.WriteFile(readyGatePath, []byte("ready"), 0o600))

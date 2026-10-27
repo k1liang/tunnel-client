@@ -45,6 +45,60 @@ import (
 
 var testMeterProvider = noopmetric.NewMeterProvider()
 
+func TestPollAndResponseUseRotatedBearerToken(t *testing.T) {
+	t.Parallel()
+	var current string
+	rotate := func(token string) { current = token }
+	rotate("first.payload.signature")
+	seen := make(chan string, 4)
+	server := newHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		endpoint, auth := filepath.Base(r.URL.Path), r.Header.Get("Authorization")
+		seen <- endpoint + " " + auth
+		switch {
+		case endpoint == "response":
+			w.WriteHeader(http.StatusOK)
+		case endpoint == "poll" && auth == "Bearer redirect.payload.signature":
+			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := NewTunnelServiceClient(t.Context(), &config.ControlPlaneConfig{
+		BaseURL: mustParseURL(t, server.URL), TunnelID: "test-tunnel", TokenProvider: func(context.Context) (string, error) { return current, nil },
+	}, nil, logger, &config.LoggingConfig{HTTPRawUnsafe: true}, testMeterProvider)
+	require.NoError(t, err)
+
+	_, _, err = client.Poll(t.Context(), 1)
+	require.NoError(t, err)
+	require.Equal(t, "poll Bearer first.payload.signature", <-seen)
+
+	rotate("second.payload.signature")
+	ctx := tunnelctx.ContextWithChannel(tunnelctx.ContextWithShardToken(t.Context(), "shard"), types.DefaultChannel)
+	_, err = client.PostResponse(ctx, "request", types.NewNotificationAck(types.DefaultChannel, http.StatusOK, http.Header{}))
+	require.NoError(t, err)
+	require.Equal(t, "response Bearer second.payload.signature", <-seen)
+	require.NotContains(t, logs.String(), "payload.signature")
+
+	rotate("invalid secret")
+	_, _, err = client.Poll(t.Context(), 1)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "invalid secret")
+	require.Empty(t, seen, "a failed rotation must not send the old token")
+
+	rotate("third.payload.signature")
+	_, _, err = client.Poll(t.Context(), 1)
+	require.NoError(t, err)
+	require.Equal(t, "poll Bearer third.payload.signature", <-seen)
+
+	rotate("redirect.payload.signature")
+	_, _, err = client.Poll(t.Context(), 1)
+	require.Error(t, err)
+	require.Equal(t, "poll Bearer redirect.payload.signature", <-seen)
+	require.Empty(t, seen, "redirect destination must not receive a bearer token")
+}
+
 func TestTunnelServiceClientPreservesExternalTunnelID(t *testing.T) {
 	t.Parallel()
 

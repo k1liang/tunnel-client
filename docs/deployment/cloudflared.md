@@ -14,12 +14,14 @@ The bundled companion is published for:
 - Windows `amd64` and `arm64`
 - Docker images for Linux `amd64` and `arm64`
 
-Every target is built from the exact pinned upstream Go module source fetched
-through an explicit proxy-only `GOPROXY`. The build verifies the pinned Go
-module checksum, then compiles the module cache entry as the main module so
-upstream `replace` directives remain effective. No supported path downloads
-GitHub release assets, source tarballs, or direct VCS source. Windows `arm64`
-uses the same source-build path as every other target.
+Release archives for all six platforms are built from the exact pinned upstream
+Go module source fetched through an explicit proxy-only `GOPROXY`. The build
+verifies the pinned Go module checksum, then compiles the module cache entry as
+the main module so upstream `replace` directives remain effective. Docker image
+companions are built offline from a checksum-pinned upstream source archive and
+a separately pinned vendor archive. No supported path downloads GitHub release
+assets or direct VCS source. Windows `arm64` uses the same source-build path as
+the other release archive platforms.
 
 Each platform archive contains:
 
@@ -149,9 +151,9 @@ exports and effective config snapshots.
 
 ## Pin, provenance, and security updates
 
-The pinned version is `2026.8.2`, from the official
-[`cloudflare/cloudflared` release](https://github.com/cloudflare/cloudflared/releases/tag/2026.8.2)
-at release commit `733bfb939963e150dcf5c4faddb1603f744fbc98`. The checked-in
+The pinned version is `2026.10.2`, from the official
+[`cloudflare/cloudflared` release](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.2)
+at release commit `002a5ccaf75a4e612bfa451063c1d82a2d13336b`. The checked-in
 [`pkg/cloudflared/manifest.json`](../../pkg/cloudflared/manifest.json) records
 the exact Go pseudo-version, package path, module checksum, `go.mod` checksum,
 build timestamp, and supported platforms. `scripts/build_cloudflared.sh` uses

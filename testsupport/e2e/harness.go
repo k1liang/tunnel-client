@@ -29,6 +29,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/harpoon"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/oauth"
+	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/types"
 	"github.com/openai/tunnel-client/testsupport/mockmcpserver"
@@ -197,6 +198,7 @@ type Harness struct {
 	HarpoonRegistry  *harpoon.Registry
 	MCPProbeState    *mcpclient.ProbeState
 	OAuthState       *oauth.DiscoveryState
+	StartupCatalog   *hostbus.StartupCatalogState
 	PollHealth       *controlplane.PollHealth
 	DeliveryHealth   *controlplane.DeliveryHealth
 	QueueHealth      *controlplane.QueueHealth
@@ -631,6 +633,7 @@ func (h *Harness) startTunnelClient(t testing.TB) *TunnelClient {
 		harpoonRegistry  *harpoon.Registry
 		mcpProbeState    *mcpclient.ProbeState
 		oauthState       *oauth.DiscoveryState
+		startupCatalog   *hostbus.StartupCatalogState
 		pollHealth       *controlplane.PollHealth
 		deliveryHealth   *controlplane.DeliveryHealth
 		queueHealth      *controlplane.QueueHealth
@@ -639,7 +642,7 @@ func (h *Harness) startTunnelClient(t testing.TB) *TunnelClient {
 	options := []fx.Option{
 		fx.Provide(func() io.Writer { return logWriter }),
 		fx.WithLogger(func(*slog.Logger) fxevent.Logger { return fxevent.NopLogger }),
-		fx.Populate(&harpoonRegistry, &mcpProbeState, &oauthState, &pollHealth, &deliveryHealth, &queueHealth, &dispatcherHealth),
+		fx.Populate(&harpoonRegistry, &mcpProbeState, &oauthState, &startupCatalog, &pollHealth, &deliveryHealth, &queueHealth, &dispatcherHealth),
 		fx.Decorate(func(fetcher controlplane.Fetcher) controlplane.Fetcher {
 			return poller.wrap(fetcher, h.commandObserver)
 		}),
@@ -668,6 +671,7 @@ func (h *Harness) startTunnelClient(t testing.TB) *TunnelClient {
 		h.HarpoonRegistry = harpoonRegistry
 		h.MCPProbeState = mcpProbeState
 		h.OAuthState = oauthState
+		h.StartupCatalog = startupCatalog
 		h.PollHealth = pollHealth
 		h.DeliveryHealth = deliveryHealth
 		h.QueueHealth = queueHealth

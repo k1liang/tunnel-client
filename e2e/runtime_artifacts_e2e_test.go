@@ -1110,6 +1110,7 @@ func runtimeArtifactEnvironment(overrides map[string]string) []string {
 		"LOG_FORMAT":                             {},
 		"LOG_LEVEL":                              {},
 		"MCP_FORWARD_TRACE_CONTEXT":              {},
+		"MCP_STDIO_FAILURE_POLICY":               {},
 		"OPEN_WEB_UI":                            {},
 		"OPENAI_API_KEY":                         {},
 		"ALL_PROXY":                              {},

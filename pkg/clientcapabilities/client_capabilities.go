@@ -14,6 +14,7 @@ const (
 	// WrongClusterV1 supports learning a replacement polling token from a
 	// validated wrong_cluster correction and retrying at the same endpoint.
 	WrongClusterV1 = "wrong-cluster-v1"
+	TraceContextV1 = "trace-context-v1"
 
 	MaxValueBytes = 4096
 	MaxMembers    = 64

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${TUNNEL_CLIENT_PYTHON_RUNFILE:-}" ]]; then
+  test_python="$(rlocation "${TUNNEL_CLIENT_PYTHON_RUNFILE}")"
+  export PATH="$(dirname "${test_python}"):${PATH:-/usr/bin:/bin}"
+fi
+
 flavor="${1:-}"
 case "${flavor}" in
   runtime|runtime-cloudflared) ;;

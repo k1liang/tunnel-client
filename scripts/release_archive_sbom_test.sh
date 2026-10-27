@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${TUNNEL_CLIENT_PYTHON_RUNFILE:-}" ]]; then
+  test_python="$(rlocation "${TUNNEL_CLIENT_PYTHON_RUNFILE}")"
+  export PATH="$(dirname "${test_python}"):${PATH:-/usr/bin:/bin}"
+fi
+
 resolved_script_path="$(python3 - "${BASH_SOURCE[0]}" <<'PY'
 import os
 import sys

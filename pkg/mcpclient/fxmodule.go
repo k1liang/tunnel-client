@@ -24,7 +24,9 @@ import (
 	"github.com/openai/tunnel-client/pkg/types"
 	"github.com/openai/tunnel-client/pkg/version"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/fx"
 
 	"github.com/openai/tunnel-client/pkg/mcpclient/internal"
@@ -52,6 +54,8 @@ const defaultProbeTimeout = 2 * time.Second
 const (
 	defaultStartupProbeBackoffMin = 50 * time.Millisecond
 	defaultStartupProbeBackoffMax = time.Second
+	defaultHTTPProbeBackoffMin    = time.Second
+	defaultHTTPProbeBackoffMax    = 30 * time.Second
 )
 
 type clientParams struct {
@@ -142,7 +146,8 @@ func newMcpClient(p clientParams) (clientOutputs, error) {
 	}, nil
 }
 
-// probeMcpServer performs a one-time discovery handshake to confirm connectivity and record server metadata.
+// probeMcpServer performs the startup discovery handshake, retrying transient
+// HTTP unavailability so readiness can recover without restarting the client.
 func probeMcpServer(p runnerParams) error {
 	if p.Config == nil {
 		return fmt.Errorf("mcpclient: mcp config is required")
@@ -204,7 +209,11 @@ func probeMcpServer(p runnerParams) error {
 					)
 					return
 				}
-				runStartupProbe(ctx, defaultProbeTimeout, connect, logger, p.ProbeState)
+				runStartupProbeWithRetry(ctx, startupProbeRetryOptions{
+					probeTimeout: defaultProbeTimeout,
+					backoffMin:   defaultHTTPProbeBackoffMin,
+					backoffMax:   defaultHTTPProbeBackoffMax,
+				}, connect, logger, p.ProbeState)
 			}()
 			return nil
 		},
@@ -263,36 +272,6 @@ func (e *probeTransportError) Unwrap() error {
 	return e.cause
 }
 
-func runStartupProbe(
-	ctx context.Context,
-	timeout time.Duration,
-	connect func(context.Context) (probeSession, error),
-	logger *slog.Logger,
-	probeState *ProbeState,
-) {
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	resultCh := make(chan startupProbeResult)
-	go func() {
-		sess, err := connect(probeCtx)
-		deliverStartupProbeResult(probeCtx, resultCh, startupProbeResult{session: sess, err: err})
-	}()
-
-	select {
-	case <-probeCtx.Done():
-		err := NewProbeTimeoutError(timeout, probeCtx.Err())
-		if probeState != nil {
-			probeState.Set(err)
-		}
-		if logger != nil {
-			logger.ErrorContext(ctx, "mcp probe timed out", slog.Duration("timeout", timeout), slog.String("error", err.Error()))
-		}
-	case res := <-resultCh:
-		recordStartupProbeResult(ctx, logger, probeState, res)
-	}
-}
-
 type startupProbeResult struct {
 	session probeSession
 	err     error
@@ -309,10 +288,10 @@ type startupProbeRetryOptions struct {
 	wait                  startupProbeRetryWaiter
 }
 
-// runStartupProbeWithRetry keeps ProbeState pending while the opt-in listener
-// wait sees retryable pre-connect failures. It never retries an HTTP response
-// or an application-level MCP failure, so already-polled commands are never
-// replayed by this startup path.
+// runStartupProbeWithRetry keeps ProbeState pending while startup initialization
+// receives HTTP 429 or 5xx. The opt-in listener wait additionally retries its
+// existing pre-connect failures, within its configured absolute deadline.
+// Only discovery handshakes run here; polled commands are never replayed.
 func runStartupProbeWithRetry(
 	ctx context.Context,
 	options startupProbeRetryOptions,
@@ -320,10 +299,6 @@ func runStartupProbeWithRetry(
 	logger *slog.Logger,
 	probeState *ProbeState,
 ) {
-	if options.waitTimeout <= 0 {
-		runStartupProbe(ctx, options.probeTimeout, connect, logger, probeState)
-		return
-	}
 	if options.probeTimeout <= 0 {
 		options.probeTimeout = defaultProbeTimeout
 	}
@@ -337,15 +312,19 @@ func runStartupProbeWithRetry(
 		options.wait = waitForStartupProbeRetry
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, options.waitTimeout)
-	defer cancel()
+	waitCtx := ctx
+	if options.waitTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, options.waitTimeout)
+		defer cancel()
+	}
 
 	backoff := options.backoffMin
 	attempt := 0
 	var lastErr error
 	for {
 		if err := waitCtx.Err(); err != nil {
-			if errors.Is(err, context.Canceled) {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return
 			}
 			recordStartupWaitTimeout(ctx, logger, probeState, options.waitTimeout, lastErr)
@@ -355,13 +334,17 @@ func runStartupProbeWithRetry(
 		attempt++
 		res, settled := runStartupProbeAttempt(waitCtx, options.probeTimeout, connect)
 		if !settled {
-			if errors.Is(waitCtx.Err(), context.Canceled) {
+			if ctx.Err() != nil || errors.Is(waitCtx.Err(), context.Canceled) {
 				return
 			}
 			recordStartupWaitTimeout(ctx, logger, probeState, options.waitTimeout, lastErr)
 			return
 		}
-		if res.err == nil || !isRetryableStartupProbeError(res.err, options.retryUnixSocketENOENT) {
+		retryable := isRetryableStartupProbeHTTPError(res.err)
+		if options.waitTimeout > 0 {
+			retryable = isRetryableStartupProbeError(res.err, options.retryUnixSocketENOENT)
+		}
+		if res.err == nil || !retryable {
 			recordStartupProbeResult(ctx, logger, probeState, res)
 			return
 		}
@@ -375,7 +358,7 @@ func runStartupProbeWithRetry(
 			)
 		}
 		if err := options.wait(waitCtx, backoff); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(waitCtx.Err(), context.Canceled) {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(waitCtx.Err(), context.Canceled) {
 				return
 			}
 			recordStartupWaitTimeout(ctx, logger, probeState, options.waitTimeout, lastErr)
@@ -450,12 +433,21 @@ func isRetryableStartupProbeError(err error, retryUnixSocketENOENT bool) bool {
 	}
 	var statusErr *ProbeHTTPStatusError
 	if errors.As(err, &statusErr) && statusErr.StatusCode != 0 {
-		return false
+		return isRetryableStartupProbeHTTPError(err)
 	}
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}
 	return retryUnixSocketENOENT && errors.Is(err, syscall.ENOENT)
+}
+
+func isRetryableStartupProbeHTTPError(err error) bool {
+	var statusErr *ProbeHTTPStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusTooManyRequests ||
+		(statusErr.StatusCode >= http.StatusInternalServerError && statusErr.StatusCode <= 599)
 }
 
 func recordStartupWaitTimeout(
@@ -537,7 +529,7 @@ func (w slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func buildMcpHTTPTransport(logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider *sdkmetric.MeterProvider, tlsBundle *tlsconfig.Bundle, clientCertificate *tlsconfig.ClientCertificate, unixSocketPath string, proxyURL *url.URL, serverURL *url.URL, extraHeaders map[string]string, discoveryExtraHeaders map[string]string) (http.RoundTripper, error) {
+func buildMcpHTTPTransport(logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider *sdkmetric.MeterProvider, tlsBundle *tlsconfig.Bundle, clientCertificate *tlsconfig.ClientCertificate, unixSocketPath string, proxyURL *url.URL, serverURL *url.URL, extraHeaders map[string]string, discoveryExtraHeaders map[string]string, localTracing bool) (http.RoundTripper, error) {
 	// Order matters (outermost to innermost):
 	//   1. Static headers apply operator headers to the configured MCP origin.
 	//   2. Forwarding injects per-request connector headers last so they win conflicts.
@@ -575,10 +567,14 @@ func buildMcpHTTPTransport(logger *slog.Logger, loggingCfg *runtimeconfig.Loggin
 		}
 	}
 	base = tcmetrics.WithHTTPClientMetricAttributes(base)
-	base = otelhttp.NewTransport(
-		base,
-		otelhttp.WithMeterProvider(meterProvider),
-	)
+	options := []otelhttp.Option{otelhttp.WithMeterProvider(meterProvider)}
+	if localTracing {
+		options = append(options,
+			otelhttp.WithTracerProvider(noop.NewTracerProvider()),
+			otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
+		)
+	}
+	base = otelhttp.NewTransport(base, options...)
 	forwardingLogger := logger.With(
 		slog.String(tclog.FieldComponent, tclog.ComponentMcpClient),
 		slog.String("transport", "forwarding_rt"),

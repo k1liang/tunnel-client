@@ -435,6 +435,72 @@ func TestPollRoutingCorrectionUsesExistingBackoffAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestPollRoutingMismatchUsesBackoffWithoutChangingRoute(t *testing.T) {
+	t.Parallel()
+	const endpoint = "https://eu.api.openai.com"
+	const tunnelID = "tunnel_extn_0123456789abcdef0123456789abcdef"
+	const token = "existing-route"
+	const revision = 17
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempts := 0
+	client := newRoutingTestClient(t, endpoint, tunnelID, func(req *http.Request) (*http.Response, error) {
+		attempts++
+		assert.Equal(t, http.MethodGet, req.Method)
+		assert.Equal(t, endpoint, req.URL.Scheme+"://"+req.URL.Host)
+		assert.Equal(t, "/v1/tunnels/"+tunnelID+"/poll", req.URL.Path)
+		assert.Equal(t, "Bearer fixture-api-key", req.Header.Get("Authorization"))
+		if attempts == 1 {
+			assert.Empty(t, req.Header.Values(routingTestTokenHeader))
+			return routingTestCorrection(req, token, revision), nil
+		}
+		assert.Equal(t, token, req.Header.Get(routingTestTokenHeader))
+		return routingTestResponse(req, http.StatusMisdirectedRequest, http.Header{
+			"Content-Type":  {"application/json"},
+			"Cache-Control": {"no-store"},
+			"Retry-After":   {"1"},
+		}, `{"error":{"message":"This server does not serve this tunnel.","type":"invalid_request_error","param":"tunnel_id","code":"tunnel_routing_mismatch"}}`), nil
+	})
+
+	// Learn a token through the optional correction protocol before receiving a
+	// generic misdirected-request rejection, which carries no routing correction.
+	_, _, err := client.Poll(ctx, 1)
+	require.Error(t, err)
+	assertRoutingState(t, client, token, new(uint64(revision)))
+	_, _, err = client.Poll(ctx, 1)
+	var statusErr *APIStatusError
+	require.ErrorAs(t, err, &statusErr)
+	assert.Equal(t, http.StatusMisdirectedRequest, statusErr.StatusCode())
+	assert.Equal(t, "tunnel_routing_mismatch", statusErr.Code())
+	assert.Equal(t, "This server does not serve this tunnel.", statusErr.Message())
+	retryAfter, hasRetryAfter := statusErr.RetryAfter()
+	assert.True(t, hasRetryAfter)
+	assert.Equal(t, time.Second, retryAfter)
+	assert.Equal(t, 2, attempts, "each Poll must make only one HTTP attempt")
+
+	q := &chanQueue{ch: make(chan controlplane.PolledCommand, 1)}
+	p, err := NewPoller(q, client, newDiscardLogger(), testMeterProvider.Meter("routing-test"), time.Second, 0, 0, 0)
+	require.NoError(t, err)
+	loop := p.(*poller)
+	assert.True(t, loop.backoff.Jitter)
+	loop.backoff.Jitter = false
+	var delays []time.Duration
+	loop.retrySleep = func(ctx context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		assert.Equal(t, len(delays)+2, attempts, "one attempt per ordinary backoff")
+		assertRoutingState(t, client, token, new(uint64(revision)))
+		if len(delays) == 5 {
+			cancel()
+			return sleepWithContext(ctx, delay)
+		}
+		return true
+	}
+	p.Run(ctx)
+	assert.Equal(t, []time.Duration{time.Second, time.Second, time.Second, 1600 * time.Millisecond, 3200 * time.Millisecond}, delays)
+	assert.Equal(t, 7, attempts, "cancellation must prevent another attempt")
+	assertRoutingState(t, client, token, new(uint64(revision)))
+}
+
 func TestPollRoutingErrorsNeverExposeCorrectionPayloads(t *testing.T) {
 	t.Parallel()
 	const secret = "private-routing-token-do-not-log"

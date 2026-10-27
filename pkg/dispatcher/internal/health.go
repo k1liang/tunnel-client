@@ -20,6 +20,7 @@ type workOutcome struct{ failed, timedOut bool }
 // intentionally return nil after forwarding an error or dropping an expired
 // command; recording here preserves those return and response contracts.
 func recordWorkFailure(ctx context.Context, err error, status int) {
+	markCommandTraceFailed(ctx)
 	outcome, _ := ctx.Value(workOutcomeKey{}).(*workOutcome)
 	if outcome == nil {
 		return

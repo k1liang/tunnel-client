@@ -207,7 +207,7 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 
 				retryBackoff := retryPolicy.backoff()
 				// Retry the full discovery sequence with a fresh timeout so a
-				// transient startup timeout can observe recovered probe and metadata
+				// transient startup failure can observe recovered probe and metadata
 				// endpoints without terminally settling readiness.
 				for {
 					fetchCtx, fetchCancel := context.WithTimeout(ctx, DefaultDiscoveryTimeout)
@@ -235,15 +235,25 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 					}
 
 					resp, sourceURL, attempts, err := FetchOAuthMetadata(fetchCtx, p.HTTPClient, candidates, logger)
+					if err == nil && resp != nil && isRetryableDiscoveryResponseStatus(resp.ResponseCode()) {
+						// Queued discovery forwards valid metadata with its original
+						// HTTP status. Startup must instead recover before publishing
+						// a catalog, even when an error response contains valid JSON.
+						err = withDiscoveryFailureType(
+							fmt.Errorf("oauth discovery returned HTTP %d", resp.ResponseCode()),
+							discoveryFailureTypeRetryableResponse,
+						)
+					}
 					result := BuildDiscoveryResult(resp, sourceURL, start, attempts)
 					if err != nil {
 						if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 							fetchCancel()
 							return
 						}
-						if classifyDiscoveryFailure(err) == discoveryFailureTypeTimeoutOnly {
+						failureType := classifyDiscoveryFailure(err)
+						if failureType == discoveryFailureTypeTimeoutOnly || failureType == discoveryFailureTypeRetryableResponse {
 							retryIn := retryBackoff.Duration()
-							logger.WarnContext(fetchCtx, "OAuth discovery timed out; retrying",
+							logger.WarnContext(fetchCtx, "OAuth discovery failed; retrying",
 								slog.String("error", err.Error()),
 								slog.Duration("retry_in", retryIn),
 							)
@@ -295,7 +305,17 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 					if result != nil && authServerMetaFetch != nil {
 						result.AuthServerMetadata = authServerMetaFetch
 					}
-					p.State.Set(result, nil, probe, candidateStrings)
+					if authServerMetaFetch != nil && (authServerMetaFetch.failureType == discoveryFailureTypeRetryableResponse ||
+						authServerMetaFetch.failureType == discoveryFailureTypeTimeoutOnly) {
+						retryIn := retryBackoff.Duration()
+						logger.WarnContext(fetchCtx, "OAuth authorization-server metadata unavailable; retrying", slog.Duration("retry_in", retryIn))
+						fetchCancel()
+						if !retryPolicy.waitForRetry(ctx, retryIn) {
+							return
+						}
+						continue
+					}
+					p.State.Set(result, err, probe, candidateStrings)
 					if err != nil {
 						completeStartupCatalog(err)
 						logger.ErrorContext(fetchCtx, "OAuth discovery bundle build failed", slog.String("error", err.Error()))

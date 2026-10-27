@@ -57,12 +57,12 @@ func NewStartupCatalogDigestState() *startupCatalogDigestState {
 // Capture computes and stores the first startup digest. Subsequent calls keep
 // the original startup boundary intact. Only the keyed digest survives this
 // call; the canonical payload is discarded by computeStartupCatalogDigest.
-func (s *startupCatalogDigestState) Capture(registry *Registry, controlPlane *runtimeconfig.ControlPlaneConfig) error {
+func (s *startupCatalogDigestState) Capture(ctx context.Context, registry *Registry, controlPlane *runtimeconfig.ControlPlaneConfig) error {
 	if s == nil {
 		return errStartupCatalogDigestUnavailable
 	}
 	s.once.Do(func() {
-		digest, err := computeStartupCatalogDigest(registry, controlPlane)
+		digest, err := computeStartupCatalogDigest(ctx, registry, controlPlane)
 		s.mu.Lock()
 		s.digest = digest
 		s.err = err
@@ -205,7 +205,7 @@ func logStartupCatalogDigest(
 	if logger == nil {
 		return errStartupCatalogDigestUnavailable
 	}
-	digest, err := computeStartupCatalogDigest(registry, controlPlane)
+	digest, err := computeStartupCatalogDigest(ctx, registry, controlPlane)
 	if err != nil {
 		return err
 	}
@@ -237,10 +237,11 @@ func logStartupCatalogDigestValue(
 }
 
 func computeStartupCatalogDigest(
+	ctx context.Context,
 	registry *Registry,
 	controlPlane *runtimeconfig.ControlPlaneConfig,
 ) (startupCatalogDigest, error) {
-	if registry == nil || controlPlane == nil || controlPlane.APIKey == "" || controlPlane.TunnelID.String() == "" {
+	if registry == nil || controlPlane == nil || controlPlane.TunnelID.String() == "" {
 		return startupCatalogDigest{}, errStartupCatalogDigestUnavailable
 	}
 
@@ -250,7 +251,13 @@ func computeStartupCatalogDigest(
 		return startupCatalogDigest{}, errStartupCatalogDigestUnavailable
 	}
 
-	derivedKey := deriveStartupCatalogDigestKey(controlPlane.APIKey, controlPlane.TunnelID.String())
+	// Capture uses the credential at startup. Later token rotation must not
+	// change the digest of the catalog that enabled this client to poll.
+	credential, err := controlPlane.BearerToken(ctx)
+	if err != nil {
+		return startupCatalogDigest{}, errStartupCatalogDigestUnavailable
+	}
+	derivedKey := deriveStartupCatalogDigestKey(credential, controlPlane.TunnelID.String())
 	mac := hmac.New(sha256.New, derivedKey[:])
 	writeDigestFrame(mac, startupCatalogDigestPayloadDomain)
 	_, _ = mac.Write(payload)

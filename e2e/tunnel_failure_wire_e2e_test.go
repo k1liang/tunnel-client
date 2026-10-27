@@ -3,12 +3,16 @@ package e2e_test
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/openai/tunnel-client/pkg/config"
 	"github.com/openai/tunnel-client/pkg/controlplane/wiretypes"
 	harnesspkg "github.com/openai/tunnel-client/testsupport/e2e"
-	"github.com/openai/tunnel-client/testsupport/mockmcpserver"
 	"github.com/openai/tunnel-client/testsupport/mocktunnelservice"
 )
 
@@ -21,7 +25,22 @@ func TestSynthesizedTargetHTTPFailureAppearsOnWireAndTunnelServiceAcceptsIt(t *t
 		targetOnlyValue = "target-body-must-not-cross-the-tunnel"
 	)
 
+	commandReady := make(chan struct{})
+	var failTarget atomic.Bool
+	var mcpProxy *httputil.ReverseProxy
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failTarget.Load() {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(targetOnlyValue))
+			return
+		}
+		mcpProxy.ServeHTTP(w, r)
+	}))
+	defer front.Close()
+
 	command := mocktunnelservice.CommandResponse{
+		DeliverAfter: commandReady,
 		Command: mocktunnelservice.NewCommand(
 			requestID,
 			json.RawMessage(`{
@@ -95,16 +114,27 @@ func TestSynthesizedTargetHTTPFailureAppearsOnWireAndTunnelServiceAcceptsIt(t *t
 
 	h := harnesspkg.NewHarness(
 		t,
+		harnesspkg.WithPreserveClientURLs(),
+		harnesspkg.WithScenarioTimeout(10*time.Second),
+		harnesspkg.WithClientConfig(func(cfg *config.Config) {
+			cfg.MCP.ServerURL = mustParseURL(t, front.URL)
+		}),
 		harnesspkg.WithControlPlaneOptions(
 			mocktunnelservice.WithCommandResponses(command),
 		),
-		harnesspkg.WithMCPOptions(
-			mockmcpserver.WithHostHandler("127.0.0.1", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "text/plain")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte(targetOnlyValue))
-			})),
-		),
+		harnesspkg.WithBeforeClientStart(func(h *harnesspkg.Harness) {
+			mcpProxy = httputil.NewSingleHostReverseProxy(h.MCP.BaseURL())
+		}),
+		harnesspkg.WithAfterClientStart(func(h *harnesspkg.Harness) {
+			// Exercise a queued command's target failure after startup has
+			// established a usable MCP connection and completed discovery.
+			waitHealthStartup(t, h)
+			if _, err, _ := h.MCPProbeState.Wait(0); err != nil {
+				t.Fatalf("MCP startup probe failed before target failure injection: %v", err)
+			}
+			failTarget.Store(true)
+			close(commandReady)
+		}),
 	)
 
 	h.ExecuteScenarious(t)

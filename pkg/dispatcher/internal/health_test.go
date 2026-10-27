@@ -24,9 +24,24 @@ import (
 
 func TestActivityHealthCapturesOAuthGatewayTimeoutWithValidMetadata(t *testing.T) {
 	t.Parallel()
+	testActivityHealthCapturesOAuthErrorResponse(t, http.StatusGatewayTimeout, 1)
+}
+
+func TestActivityHealthCapturesOAuthTransientStatusWithValidMetadata(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			testActivityHealthCapturesOAuthErrorResponse(t, status, 0)
+		})
+	}
+}
+
+func testActivityHealthCapturesOAuthErrorResponse(t *testing.T, status int, timeouts uint64) {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusGatewayTimeout)
+		w.WriteHeader(status)
 		_, _ = fmt.Fprintf(w, `{"resource":"http://%s","scopes_supported":["read"]}`, r.Host)
 	}))
 	t.Cleanup(server.Close)
@@ -41,13 +56,13 @@ func TestActivityHealthCapturesOAuthGatewayTimeoutWithValidMetadata(t *testing.T
 	cmd := &fakeOauthDiscoveryCommand{id: "oauth-health", shardToken: "shard-health"}
 	require.NoError(t, listener.processObserved(t.Context(), cmd), "preserve the forwarded response and nil return")
 	response := responder.waitForResponse(t)
-	require.Equal(t, http.StatusGatewayTimeout, response.response.ResponseCode())
+	require.Equal(t, status, response.response.ResponseCode())
 	require.Equal(t, types.ResponseTypeOAuthDiscovery, response.response.Type())
 	snapshot := activity.Snapshot(time.Now())
 	require.Equal(t, healthstate.StatusDegraded, snapshot.Status)
 	details := snapshot.Details.(healthstate.DispatcherDetails)
 	require.Equal(t, uint64(1), details.Failures)
-	require.Equal(t, uint64(1), details.Timeouts)
+	require.Equal(t, timeouts, details.Timeouts)
 	require.Zero(t, details.Active)
 }
 

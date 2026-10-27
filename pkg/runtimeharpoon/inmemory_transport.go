@@ -30,6 +30,9 @@ type restartableInMemoryTransport struct {
 	stopped         bool
 	connections     map[*restartableInMemoryConnection]struct{}
 	sessionContexts map[*mcp.ServerSession]context.Context
+	// The dispatcher wraps this transport in a serialized forwarding transport:
+	// a shared session has only one active command ID at a time.
+	requestIDs map[*mcp.ServerSession]string
 }
 
 func newRestartableInMemoryTransport(ctx context.Context, server *mcp.Server, logger *slog.Logger) mcp.Transport {
@@ -107,8 +110,10 @@ func (t *restartableInMemoryTransport) Connect(ctx context.Context) (mcp.Connect
 		return nil, err
 	}
 	connection := &restartableInMemoryConnection{
-		base:   conn,
-		cancel: cancel,
+		base:      conn,
+		cancel:    cancel,
+		transport: t,
+		session:   session,
 	}
 	connection.onClose = func() { t.unregister(connection) }
 	if err := t.register(connection); err != nil {
@@ -159,6 +164,32 @@ func (t *restartableInMemoryTransport) unregisterSession(session *mcp.ServerSess
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.sessionContexts, session)
+	delete(t.requestIDs, session)
+}
+
+func (t *restartableInMemoryTransport) setRequestID(session *mcp.ServerSession, id string) {
+	if t == nil || session == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if id == "" {
+		delete(t.requestIDs, session)
+		return
+	}
+	if t.requestIDs == nil {
+		t.requestIDs = make(map[*mcp.ServerSession]string)
+	}
+	t.requestIDs[session] = id
+}
+
+func (t *restartableInMemoryTransport) requestID(session *mcp.ServerSession) string {
+	if t == nil || session == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.requestIDs[session]
 }
 
 func (t *restartableInMemoryTransport) sessionContext(session *mcp.ServerSession) context.Context {
@@ -193,7 +224,7 @@ func (t *restartableInMemoryTransport) withSessionCancellation(next mcp.MethodHa
 			stop()
 			cancel()
 		}()
-		return next(handlerCtx, method, req)
+		return next(contextWithOutboundRequestID(handlerCtx, t.requestID(session)), method, req)
 	}
 }
 
@@ -237,9 +268,11 @@ func (t *restartableInMemoryTransport) wait(session *mcp.ServerSession, cancel c
 }
 
 type restartableInMemoryConnection struct {
-	base    mcp.Connection
-	cancel  context.CancelFunc
-	onClose func()
+	base      mcp.Connection
+	cancel    context.CancelFunc
+	onClose   func()
+	transport *restartableInMemoryTransport
+	session   *mcp.ServerSession
 
 	closeOnce sync.Once
 	closeErr  error
@@ -255,6 +288,16 @@ func (c *restartableInMemoryConnection) Read(ctx context.Context) (jsonrpc.Messa
 func (c *restartableInMemoryConnection) Write(ctx context.Context, msg jsonrpc.Message) error {
 	if c == nil || c.base == nil {
 		return nil
+	}
+	// The server-side handler does not inherit the context passed to Write.
+	// Publish only the opted-in, validated header value to this connection's
+	// private session before the in-memory pipe delivers the request.
+	if c.transport != nil {
+		id := ""
+		if request, ok := msg.(*jsonrpc.Request); ok && request.Method == "tools/call" {
+			id = requestIDForForwarding(ctx)
+		}
+		c.transport.setRequestID(c.session, id)
 	}
 	return c.base.Write(ctx, msg)
 }

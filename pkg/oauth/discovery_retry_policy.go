@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"time"
 )
 
@@ -27,10 +28,48 @@ const (
 	discoveryFailureTypeNotApplicable discoveryFailureType = iota
 	discoveryFailureTypeTimeoutOnly
 	discoveryFailureTypeNonTimeout
+	discoveryFailureTypeRetryableResponse
 )
 
-// classifiedDiscoveryError preserves whether every candidate in a discovery
-// cycle timed out while retaining the final error's text and errors.Is/As chain.
+// discoveryResponseFailures distinguishes a temporarily unusable metadata
+// response from permanent request/configuration failures. Missing fallback URLs
+// do not veto recovery of another endpoint, but trust or transport failures do.
+type discoveryResponseFailures struct {
+	retryable bool
+	permanent bool
+}
+
+func (f *discoveryResponseFailures) record(status int, err error, invalidBody bool) {
+	if classifyDiscoveryFailure(err) == discoveryFailureTypeTimeoutOnly {
+		return
+	}
+	if status == http.StatusNotFound {
+		return
+	}
+	if isRetryableDiscoveryResponseStatus(status) ||
+		(invalidBody && status >= 200 && status < 300) {
+		f.retryable = true
+		return
+	}
+	f.permanent = true
+}
+
+func isRetryableDiscoveryResponseStatus(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+}
+
+func (f discoveryResponseFailures) classify(fallback discoveryFailureType) discoveryFailureType {
+	if f.permanent {
+		return discoveryFailureTypeNonTimeout
+	}
+	if f.retryable {
+		return discoveryFailureTypeRetryableResponse
+	}
+	return fallback
+}
+
+// classifiedDiscoveryError preserves the complete discovery cycle's retry
+// classification while retaining the final error's text and errors.Is/As chain.
 type classifiedDiscoveryError struct {
 	err         error
 	failureType discoveryFailureType

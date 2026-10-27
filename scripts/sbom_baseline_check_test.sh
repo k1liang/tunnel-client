@@ -126,9 +126,13 @@ generator_args=(
   --output "${generated_root}/${output_name}"
 )
 if [[ "${flavor}" != "runtime" ]]; then
+  cloudflared_vendor_archive="$(sbom_resolve_runfile "${TUNNEL_CLIENT_CLOUDFLARED_VENDOR_ARCHIVE_RUNFILE:-}")"
+  cloudflared_vendor_digest="$(sbom_resolve_runfile "${TUNNEL_CLIENT_CLOUDFLARED_VENDOR_DIGEST_RUNFILE:-}")"
   cloudflared_source="$(
     "${python_bin}" "${cloudflared_extractor}" \
       --archive "${cloudflared_archive}" \
+      --vendor-archive "${cloudflared_vendor_archive}" \
+      --vendor-digest "${cloudflared_vendor_digest}" \
       --output-root "${cloudflared_extract_root}"
   )"
   generator_args+=(--cloudflared-source "${cloudflared_source}")

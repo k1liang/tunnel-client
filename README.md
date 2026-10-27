@@ -51,6 +51,16 @@ then read the onboarding guide below.
   Trace forwarding is disabled by default; opt in with
   `--mcp.forward-trace-context` to carry W3C trace context in MCP `params._meta`
   over stdio and Streamable HTTP.
+  Opt-in [local span export](docs/configuration.md#local-tracing) uses
+  `--tracing.enabled --tracing.file=/private/new-trace.jsonl`. Complete traces
+  require compatible service queue handoff and caller parent propagation first.
+- **Forwarding the original HTTP request ID?** MCP HTTP forwarding is enabled
+  by default. Use `--forward-request-id=mcp,harpoon` to include Harpoon REST
+  requests, `--forward-request-id=mcp,oauth` to include eligible queued OAuth
+  discovery requests, or `--forward-request-id=none` to disable
+  automatic forwarding.
+  The same setting is available as `FORWARD_REQUEST_ID` or top-level YAML
+  `forward_request_id`; see [request ID forwarding](docs/configuration.md#request-id-forwarding).
 - **Using a namespaced tunnel ID?** Preserve the full ID returned by the service.
   The client accepts legacy IDs and aliases with a four-character namespace;
   see [tunnel identifiers](docs/protocol.md#scope).
@@ -161,7 +171,10 @@ tunnel-client help quickstart
 
 The Formula installs the matching `tunnel-client`, bundled `cloudflared`,
 and companion manifest together, while exposing only the `tunnel-client`
-command. For Docker, Kubernetes, or VM deployments, see
+command. It also installs Bash, Zsh, and Fish completions for that version.
+If your shell does not load them automatically, follow
+[Homebrew's shell completion setup](https://docs.brew.sh/Shell-Completion).
+For Docker, Kubernetes, or VM deployments, see
 [`docs/deployment/overview.md`](docs/deployment/overview.md).
 
 To generate the shareable guide output locally:
@@ -208,6 +221,8 @@ Which value comes from where:
   `tunnel-client admin tunnels create|list|get ...` with `OPENAI_ADMIN_KEY`.
 - `CONTROL_PLANE_API_KEY`: create it in Runtime API keys; this is the key used
   by `tunnel-client doctor` and `tunnel-client run`.
+- For [AWS workload identity](docs/configuration.md#aws-workload-identity), set
+  `CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID` and `CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID`.
 - `OPENAI_ADMIN_KEY`: only for `tunnel-client admin tunnels
   list|create|update|delete`. Do not use the admin key for the long-lived
   daemon.
@@ -243,6 +258,16 @@ restart. Each instance launches a separate MCP child, and initialization and
 later requests can reach different children. Stop the old instance before
 starting its replacement, or use distinct tunnel IDs for independent instances.
 See [stdio deployment limits](docs/configuration.md#stdio-deployment-limits).
+
+By default, `tunnel-client` restarts a supervised stdio child after an
+unexpected exit, stdout EOF, or stdin write failure. Calls in progress may
+fail, and legacy callers must initialize the replacement child before retrying.
+If your deployment uses an external process supervisor to restart the whole
+client, set `--mcp.stdio-failure-policy=exit`,
+`MCP_STDIO_FAILURE_POLICY=exit`, or YAML `mcp.stdio_failure_policy: exit`.
+That setting restores nonzero client exit on these failures; intentional
+shutdown still exits successfully. Remove the new flag or YAML key before
+downgrading to a version that does not recognize it.
 
 Stdio initialization is checked automatically. Legacy calls require a successful
 `initialize` exchange followed by `notifications/initialized`; premature calls
@@ -553,7 +578,7 @@ therefore reports the tag semantic version through `tunnel-client --version`,
 builds made with the Make target or explicit linker flag above append the Git
 SHA to that semantic version.
 
-Supported release archives also bundle pinned `cloudflared` `2026.8.2` beside
+Supported release archives also bundle pinned `cloudflared` `2026.10.2` beside
 the CLI for Linux `amd64`/`arm64`, macOS `amd64`/`arm64`, and Windows
 `amd64`/`arm64`.
 Official release images are published at `ghcr.io/openai/tunnel-client` for
@@ -669,9 +694,17 @@ plugin installed by `tunnel-client codex plugin install`.
   additional configured channels can target their own MCP bindings, and
   `harpoon` is routable only when Harpoon has registered targets.
 - On startup, it fetches OAuth Protected Resource Metadata from the MCP server
-  for diagnostics. Timeout-only startup failures keep readiness pending and
-  retry with bounded exponential backoff until discovery succeeds or the
-  process stops; non-timeout discovery failures still settle readiness.
+  and registers discovered Harpoon targets. Timeouts, HTTP `429`/`5xx`, and
+  malformed successful metadata responses retry with bounded exponential
+  backoff until discovery succeeds or the process stops. Permanent errors
+  remain visible through readiness; discovery validation and trusted-origin
+  restrictions still apply.
+- Before polling for Harpoon work, the runtime waits for startup discovery and
+  target registration to complete. Failed startup catalogs do not consume
+  commands, and readiness remains non-ready until registration succeeds.
+  Plain MCP servers without OAuth and explicitly scoped pollers
+  that exclude Harpoon remain supported. Transient HTTP `429`/`5xx` MCP startup
+  initialization errors also retry without replaying tunneled commands.
 - After configured and startup OAuth-discovered Harpoon targets settle, it
   emits one privacy-safe `harpoon startup catalog digest` INFO log. Compare
   replicas only when they use the same tunnel ID and control-plane runtime API
@@ -714,12 +747,17 @@ plugin installed by `tunnel-client codex plugin install`.
 ### Harpoon target templates
 
 Opt-in Harpoon templates let callers provide bounded identifiers for an
-operator-configured HTTPS GET, POST, or PUT operation, such as `/cases/{case_id}` or
+operator-configured GET, POST, or PUT operation, such as `/cases/{case_id}` or
 `/profiles?session-id={session_id}`. The client fixes the destination, method,
 query names, and authentication headers, validates each identifier, and never
 follows redirects. POST/PUT require an explicit body policy for content types,
 byte limits, required or optional bodies, and validation. GET remains bodyless;
 DELETE is unsupported. Existing exact-URL targets continue to work.
+
+Templates use HTTPS by default. An operator can set `allow_loopback_http: true`
+on one template to call a literal loopback IP with a fixed port over HTTP.
+Those calls bypass configured HTTP proxies so local API credentials stay on
+the local connection. The setting does not enable other plaintext targets.
 
 Templates use YAML `config_version: 2` and `template.version: 1`, and execute
 through the shared `call_target` MCP tool without a caller-supplied method.

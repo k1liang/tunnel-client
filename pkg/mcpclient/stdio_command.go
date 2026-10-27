@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/fx"
@@ -27,18 +28,52 @@ type stdioCommandTransport struct {
 	observation           *ProtocolObservation
 	observationGeneration string
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	transport *mcp.IOTransport
-	waitDone  chan error
-	signals   chan os.Signal
-	started   bool
-	stopping  bool
+	mu              sync.Mutex
+	commandArgs     []string
+	policy          runtimeconfig.StdioFailurePolicy
+	generation      uint64
+	childStartedAt  time.Time
+	restartDelay    time.Duration
+	active          bool
+	recovering      bool
+	recoveryCancel  context.CancelFunc
+	recoveryDone    chan struct{}
+	onChildLost     func()
+	onChildStarted  func(uint64, int)
+	cmd             *exec.Cmd
+	stdin           io.WriteCloser
+	stdout          io.ReadCloser
+	transport       *mcp.IOTransport
+	waitDone        chan error
+	signals         chan os.Signal
+	started         bool
+	stopping        bool
+	signalForwarded bool
 
 	commandLabel string
 	shutdownOnce sync.Once
+}
+
+// A failed child is retired before a replacement starts. The delay also
+// bounds a crash loop without holding a dispatcher request open.
+const (
+	stdioRestartInitialDelay = 100 * time.Millisecond
+	stdioRestartMaxDelay     = 5 * time.Second
+	stdioRestartStableTime   = 30 * time.Second
+	stdioChildStopGrace      = time.Second
+)
+
+var errStdioChildRestarting = errors.New("mcpclient: stdio MCP command is restarting")
+
+// The shared transport must identify the generation of the connection it got,
+// even if the child exits between Connect returning and its caller resuming.
+type stdioGenerationConnection struct {
+	mcp.Connection
+	generation uint64
+}
+
+func (c *stdioGenerationConnection) physicalGeneration() (uint64, bool) {
+	return c.generation, true
 }
 
 // StdioRuntimeInfo describes the active stdio MCP process details.
@@ -66,7 +101,7 @@ func newStdioCommandTransport(logger *slog.Logger, lifecycle fx.Lifecycle, shutd
 	}
 }
 
-func (t *stdioCommandTransport) Transport(cfg *runtimeconfig.MCPConfig) (*mcp.IOTransport, error) {
+func (t *stdioCommandTransport) Transport(cfg *runtimeconfig.MCPConfig) (mcp.Transport, error) {
 	if cfg == nil {
 		return nil, errors.New("mcpclient: mcp config is required for stdio transport")
 	}
@@ -76,58 +111,98 @@ func (t *stdioCommandTransport) Transport(cfg *runtimeconfig.MCPConfig) (*mcp.IO
 	if t.lifecycle == nil {
 		return nil, errors.New("mcpclient: lifecycle is required for stdio transport")
 	}
+	if cfg.StdioFailurePolicy != "" && cfg.StdioFailurePolicy != runtimeconfig.StdioFailurePolicyRestart && cfg.StdioFailurePolicy != runtimeconfig.StdioFailurePolicyExit {
+		return nil, errors.New("mcpclient: invalid stdio failure policy")
+	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.transport != nil {
-		return t.transport, nil
+		return t, nil
 	}
 
-	cmd := exec.Command(cfg.CommandArgs[0], cfg.CommandArgs[1:]...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: stdio command stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return nil, fmt.Errorf("mcpclient: stdio command stdout pipe: %w", err)
-	}
-	cmd.Stderr = os.Stderr
-
-	t.cmd = cmd
-	t.stdin = stdin
-	t.stdout = stdout
-	t.waitDone = make(chan error, 1)
+	t.commandArgs = append([]string(nil), cfg.CommandArgs...)
+	t.policy = cfg.StdioFailurePolicy
 	t.commandLabel = strings.TrimSpace(cfg.Command)
 	if t.commandLabel == "" {
 		t.commandLabel = strings.Join(cfg.CommandArgs, " ")
 	}
-
-	reader := &stdioEOFReader{
-		reader: stdout,
-		onEOF: func() {
-			t.requestShutdown("stdio MCP command stdout closed", io.EOF)
-		},
+	t.generation = 1
+	cmd, stdin, stdout, transport, err := t.prepareChild(t.generation)
+	if err != nil {
+		return nil, err
 	}
-	writer := &stdioErrWriter{
-		writer: stdin,
-		onError: func(err error) {
-			t.requestShutdown("stdio MCP command stdin write failed", err)
-		},
-	}
-	t.transport = &mcp.IOTransport{
-		Reader: reader,
-		Writer: writer,
-	}
+	t.cmd, t.stdin, t.stdout, t.transport = cmd, stdin, stdout, transport
+	t.waitDone = make(chan error, 1)
 
 	t.lifecycle.Append(fx.Hook{
 		OnStart: t.start,
 		OnStop:  t.stop,
 	})
 
-	return t.transport, nil
+	return t, nil
+}
+
+// Connect never waits for a replacement child. This lets each failed logical
+// request complete and allows the next request to use a fresh MCP session.
+func (t *stdioCommandTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	t.mu.Lock()
+	if !t.active || t.stopping || t.transport == nil {
+		t.mu.Unlock()
+		return nil, errStdioChildRestarting
+	}
+	transport := t.transport
+	generation := t.generation
+	t.mu.Unlock()
+
+	conn, err := transport.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	stillCurrent := t.active && !t.stopping && t.generation == generation
+	t.mu.Unlock()
+	if !stillCurrent {
+		_ = conn.Close()
+		return nil, errStdioChildRestarting
+	}
+	return &stdioGenerationConnection{Connection: conn, generation: generation}, nil
+}
+
+func (t *stdioCommandTransport) Generation() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.generation
+}
+
+func (t *stdioCommandTransport) SetOnChildLost(callback func()) {
+	t.mu.Lock()
+	t.onChildLost = callback
+	t.mu.Unlock()
+}
+
+func (t *stdioCommandTransport) prepareChild(generation uint64) (*exec.Cmd, io.WriteCloser, io.ReadCloser, *mcp.IOTransport, error) {
+	cmd := exec.Command(t.commandArgs[0], t.commandArgs[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("mcpclient: stdio command stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, nil, nil, fmt.Errorf("mcpclient: stdio command stdout pipe: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+	transport := &mcp.IOTransport{
+		Reader: &stdioEOFReader{reader: stdout, onEOF: func() {
+			t.childLost(generation, "stdio MCP command stdout closed", io.EOF, "child_transport_closed")
+		}},
+		Writer: &stdioErrWriter{writer: stdin, onError: func(err error) {
+			t.childLost(generation, "stdio MCP command stdin write failed", err, "child_transport_closed")
+		}},
+	}
+	return cmd, stdin, stdout, transport, nil
 }
 
 func (t *stdioCommandTransport) start(ctx context.Context) error {
@@ -137,98 +212,253 @@ func (t *stdioCommandTransport) start(ctx context.Context) error {
 		t.mu.Unlock()
 		return nil
 	}
-	t.started = true
-	t.observationGeneration = t.observation.beginChild()
-	generation := t.observationGeneration
-	t.mu.Unlock()
-
 	if err := cmd.Start(); err != nil {
-		t.observation.childClosed(generation, "child_start_failed")
+		_ = t.stdin.Close()
+		_ = t.stdout.Close()
+		t.mu.Unlock()
 		return fmt.Errorf("mcpclient: start stdio command: %w", err)
 	}
-	t.observation.childStarted(generation)
+	t.started = true
+	t.active = true
+	t.childStartedAt = time.Now()
+	if t.observation != nil {
+		t.observationGeneration = t.observation.beginChild()
+		t.observation.childStarted(t.observationGeneration)
+	}
+	waitDone := t.waitDone
+	generation := t.generation
+	onChildStarted := t.onChildStarted
+	t.mu.Unlock()
 
-	t.logInfo(ctx, "stdio MCP command started", slog.String("command", t.commandLabel))
+	t.logInfo(ctx, "stdio MCP command started")
 	t.startSignalForwarding()
-
-	go t.waitForExit()
+	if onChildStarted != nil {
+		onChildStarted(generation, cmd.Process.Pid)
+	}
+	go t.waitForExit(cmd, waitDone, generation)
 	return nil
 }
 
 func (t *stdioCommandTransport) stop(ctx context.Context) error {
-	t.stopSignalForwarding()
-
 	t.mu.Lock()
+	t.stopping = true
+	t.active = false
 	cmd := t.cmd
 	waitDone := t.waitDone
 	stdin := t.stdin
+	stdout := t.stdout
 	started := t.started
-	if started {
-		t.stopping = true
-	}
+	cancel := t.recoveryCancel
+	recoveryDone := t.recoveryDone
+	observationGeneration := t.observationGeneration
 	t.mu.Unlock()
+	t.stopSignalForwarding()
 
+	if cancel != nil {
+		cancel()
+	}
 	if cmd == nil || !started {
 		return nil
 	}
-	t.closeObservation("child_stopped")
+	if t.observation != nil {
+		t.observation.childClosed(observationGeneration, "child_stopped")
+	}
 
 	if stdin != nil {
 		_ = stdin.Close()
+	}
+	if stdout != nil {
+		_ = stdout.Close()
 	}
 	if cmd.Process != nil {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	}
 
-	if waitDone == nil {
-		return nil
+	if waitDone != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-waitDone:
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-waitDone:
-		return nil
+	if recoveryDone != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-recoveryDone:
+		}
 	}
+	return nil
 }
 
-func (t *stdioCommandTransport) waitForExit() {
+func (t *stdioCommandTransport) waitForExit(cmd *exec.Cmd, waitDone chan error, generation uint64) {
+	err := cmd.Wait()
+	if err != nil {
+		t.logWarn(context.Background(), "stdio MCP command exited")
+	} else {
+		t.logInfo(context.Background(), "stdio MCP command exited")
+	}
+	waitDone <- err
+	close(waitDone)
+	t.childLost(generation, "stdio MCP command exited", err, "child_exited")
+}
+
+// childLost arbitrates the three ways a child can disappear. Only the first
+// failure for a generation invalidates the logical connection or starts a
+// recovery. The callback runs outside the mutex, before a new child is visible.
+func (t *stdioCommandTransport) childLost(generation uint64, reason string, cause error, observationReason string) {
 	t.mu.Lock()
-	cmd := t.cmd
-	waitDone := t.waitDone
-	t.mu.Unlock()
-	if cmd == nil || waitDone == nil {
+	if t.stopping || !t.active || t.generation != generation {
+		t.mu.Unlock()
 		return
 	}
-
-	err := cmd.Wait()
-	t.closeObservation("child_exited")
-	stopping := t.isStopping()
-	if err != nil {
-		t.logWarn(context.Background(), "stdio MCP command exited", slog.String("command", t.commandLabel), slog.String("error", err.Error()))
+	t.active = false
+	t.recovering = true
+	t.generation++
+	if t.restartDelay == 0 || time.Since(t.childStartedAt) >= stdioRestartStableTime {
+		t.restartDelay = stdioRestartInitialDelay
 	} else {
-		t.logInfo(context.Background(), "stdio MCP command exited", slog.String("command", t.commandLabel))
+		t.restartDelay *= 2
+		if t.restartDelay > stdioRestartMaxDelay {
+			t.restartDelay = stdioRestartMaxDelay
+		}
 	}
-	if !stopping {
-		t.requestShutdown("stdio MCP command exited", err)
+	delay := t.restartDelay
+	callback := t.onChildLost
+	policy := t.policy
+	signalForwarded := t.signalForwarded
+	cmd, stdin, stdout, waitDone := t.cmd, t.stdin, t.stdout, t.waitDone
+	observationGeneration := t.observationGeneration
+	var recoveryCtx context.Context
+	var recoveryDone chan struct{}
+	if !signalForwarded && policy != runtimeconfig.StdioFailurePolicyExit {
+		var cancel context.CancelFunc
+		recoveryCtx, cancel = context.WithCancel(context.Background())
+		t.recoveryCancel = cancel
+		recoveryDone = make(chan struct{})
+		t.recoveryDone = recoveryDone
 	}
+	t.mu.Unlock()
 
-	select {
-	case waitDone <- err:
-	default:
+	// Close old pipes before invalidating the shared SDK connection so a
+	// request that already obtained it cannot keep writing to the lost child.
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout != nil {
+		_ = stdout.Close()
+	}
+	if t.observation != nil {
+		t.observation.childClosed(observationGeneration, observationReason)
+	}
+	if callback != nil {
+		callback()
+	}
+	if signalForwarded || policy == runtimeconfig.StdioFailurePolicyExit {
+		t.requestShutdown(reason, cause)
+		return
+	}
+	t.logWarn(context.Background(), "stdio MCP command failed; restarting child", slog.String("reason", reason))
+	go t.restartChild(recoveryCtx, recoveryDone, cmd, stdin, stdout, waitDone, delay)
+}
+
+func (t *stdioCommandTransport) restartChild(ctx context.Context, done chan struct{}, oldCmd *exec.Cmd, oldStdin io.WriteCloser, oldStdout io.ReadCloser, oldWaitDone chan error, delay time.Duration) {
+	defer close(done)
+	t.retireChild(ctx, oldCmd, oldStdin, oldStdout, oldWaitDone)
+	for {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		t.mu.Lock()
+		generation := t.generation + 1
+		t.mu.Unlock()
+		cmd, stdin, stdout, transport, err := t.prepareChild(generation)
+		if err == nil {
+			t.mu.Lock()
+			if t.stopping || ctx.Err() != nil {
+				t.mu.Unlock()
+				_ = stdin.Close()
+				_ = stdout.Close()
+				return
+			}
+			err = cmd.Start()
+			if err == nil {
+				t.cmd, t.stdin, t.stdout, t.transport = cmd, stdin, stdout, transport
+				t.waitDone = make(chan error, 1)
+				t.generation = generation
+				t.childStartedAt = time.Now()
+				t.restartDelay = delay
+				if t.observation != nil {
+					t.observationGeneration = t.observation.beginChild()
+					t.observation.childStarted(t.observationGeneration)
+				}
+				t.active = true
+				t.recovering = false
+				waitDone := t.waitDone
+				onChildStarted := t.onChildStarted
+				t.mu.Unlock()
+				t.logInfo(context.Background(), "stdio MCP command restarted")
+				if onChildStarted != nil {
+					onChildStarted(generation, cmd.Process.Pid)
+				}
+				go t.waitForExit(cmd, waitDone, generation)
+				return
+			}
+			t.mu.Unlock()
+			_ = stdin.Close()
+			_ = stdout.Close()
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		t.logWarn(context.Background(), "stdio MCP command restart failed")
+		if delay < stdioRestartMaxDelay {
+			delay *= 2
+			if delay > stdioRestartMaxDelay {
+				delay = stdioRestartMaxDelay
+			}
+		}
 	}
 }
 
-func (t *stdioCommandTransport) isStopping() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.stopping
+func (t *stdioCommandTransport) retireChild(ctx context.Context, cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, waitDone chan error) {
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout != nil {
+		_ = stdout.Close()
+	}
+	if cmd == nil || cmd.Process == nil || waitDone == nil {
+		return
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(stdioChildStopGrace)
+	defer timer.Stop()
+	select {
+	case <-waitDone:
+		return
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	_ = cmd.Process.Kill()
+	<-waitDone
 }
 
 func (t *stdioCommandTransport) requestShutdown(reason string, cause error) {
-	if t == nil || t.isStopping() {
+	if t == nil {
 		return
 	}
-	t.closeObservation("child_transport_closed")
+	t.mu.Lock()
+	stopping := t.stopping
+	t.mu.Unlock()
+	if stopping {
+		return
+	}
 	t.shutdownOnce.Do(func() {
 		attrs := []any{slog.String("reason", reason), slog.String("command", t.commandLabel)}
 		if cause != nil {
@@ -239,17 +469,18 @@ func (t *stdioCommandTransport) requestShutdown(reason string, cause error) {
 			return
 		}
 		t.logWarn(context.Background(), "stdio MCP command failed; requesting tunnel-client shutdown", attrs...)
-		if err := t.shutdowner.Shutdown(); err != nil {
+		// An unexpected loss of stdio must fail the parent. A parent signal
+		// is intentional even if the child's exit wins the stop race.
+		options := []fx.ShutdownOption{fx.ExitCode(1)}
+		t.mu.Lock()
+		if t.signalForwarded {
+			options = nil
+		}
+		t.mu.Unlock()
+		if err := t.shutdowner.Shutdown(options...); err != nil {
 			t.logWarn(context.Background(), "stdio MCP shutdown request failed", slog.String("error", err.Error()))
 		}
 	})
-}
-
-func (t *stdioCommandTransport) closeObservation(reason string) {
-	t.mu.Lock()
-	generation := t.observationGeneration
-	t.mu.Unlock()
-	t.observation.childClosed(generation, reason)
 }
 
 func (t *stdioCommandTransport) startSignalForwarding() {
@@ -266,12 +497,42 @@ func (t *stdioCommandTransport) startSignalForwarding() {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		for sig := range signals {
-			if cmd.Process == nil {
-				continue
-			}
-			_ = cmd.Process.Signal(sig)
+			t.forwardSignal(nil, sig)
 		}
 	}()
+}
+
+func (t *stdioCommandTransport) forwardSignal(cmd *exec.Cmd, sig os.Signal) {
+	t.mu.Lock()
+	if cmd == nil {
+		cmd = t.cmd
+	}
+	if t.stopping {
+		t.mu.Unlock()
+		return
+	}
+	if t.recovering || !t.active {
+		t.signalForwarded = true
+		cancel := t.recoveryCancel
+		t.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		t.requestShutdown("parent signal during stdio MCP command restart", nil)
+		return
+	}
+	if cmd != nil && cmd == t.cmd {
+		// Keep signal intent and child loss ordered even if Process.Signal
+		// races the child exit and fails.
+		t.signalForwarded = true
+		failed := cmd.Process == nil || cmd.Process.Signal(sig) != nil
+		t.mu.Unlock()
+		if failed {
+			t.requestShutdown("parent signal after stdio MCP command exit", nil)
+		}
+		return
+	}
+	t.mu.Unlock()
 }
 
 func (t *stdioCommandTransport) stopSignalForwarding() {
@@ -296,7 +557,7 @@ func (t *stdioCommandTransport) StdioRuntimeInfo() StdioRuntimeInfo {
 	if info.Command == "" && t.cmd != nil {
 		info.Command = strings.Join(t.cmd.Args, " ")
 	}
-	if t.cmd != nil && t.cmd.Process != nil {
+	if t.active && t.cmd != nil && t.cmd.Process != nil {
 		info.PID = t.cmd.Process.Pid
 	}
 	return info

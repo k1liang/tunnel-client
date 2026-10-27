@@ -211,7 +211,7 @@ func TestStartupCatalogDigestLifecycleWaitsForFinalizationAndIgnoresLaterMutatio
 	registry := newCatalogDigestRegistry(t, catalogDigestTarget("auth", "https://auth.example.test/oauth", "", nil, ""))
 	controlPlane := catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")
 	digestState := NewStartupCatalogDigestState()
-	require.NoError(t, digestState.Capture(registry, controlPlane))
+	require.NoError(t, digestState.Capture(t.Context(), registry, controlPlane))
 	startupCatalog := hostbus.NewStartupCatalogState()
 	writer := newCatalogDigestSignalWriter()
 	logger := slog.New(slog.NewJSONHandler(writer, nil))
@@ -246,7 +246,7 @@ func TestStartupCatalogDigestLogsEmptyFinalizedCatalog(t *testing.T) {
 
 	registry := newCatalogDigestRegistry(t)
 	digestState := NewStartupCatalogDigestState()
-	require.NoError(t, digestState.Capture(registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
+	require.NoError(t, digestState.Capture(t.Context(), registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
 	startupCatalog := hostbus.NewStartupCatalogState()
 	startupCatalog.Complete(nil)
 	var output bytes.Buffer
@@ -271,7 +271,7 @@ func TestStartupCatalogDigestSkipsFailedFinalization(t *testing.T) {
 
 	registry := newCatalogDigestRegistry(t, catalogDigestTarget("auth", "https://auth.example.test/oauth", "", nil, ""))
 	digestState := NewStartupCatalogDigestState()
-	require.NoError(t, digestState.Capture(registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
+	require.NoError(t, digestState.Capture(t.Context(), registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
 	startupCatalog := hostbus.NewStartupCatalogState()
 	startupCatalog.Complete(errors.New("hard startup registration failure"))
 	var output bytes.Buffer
@@ -293,7 +293,7 @@ func TestStartupCatalogDigestSkipsShutdownCancellation(t *testing.T) {
 
 	registry := newCatalogDigestRegistry(t, catalogDigestTarget("auth", "https://auth.example.test/oauth", "", nil, ""))
 	digestState := NewStartupCatalogDigestState()
-	require.NoError(t, digestState.Capture(registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
+	require.NoError(t, digestState.Capture(t.Context(), registry, catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")))
 	startupCatalog := hostbus.NewStartupCatalogState()
 	startupCatalog.Complete(nil)
 	var output bytes.Buffer
@@ -318,20 +318,38 @@ func TestStartupCatalogDigestStateKeepsFirstCapturedBoundary(t *testing.T) {
 	registry := newCatalogDigestRegistry(t, catalogDigestTarget("auth", "https://auth.example.test/oauth", "", nil, ""))
 	controlPlane := catalogDigestControlPlane("runtime-secret", "tunnel_0123456789abcdef0123456789abcdef")
 	digestState := NewStartupCatalogDigestState()
-	require.NoError(t, digestState.Capture(registry, controlPlane))
+	require.NoError(t, digestState.Capture(t.Context(), registry, controlPlane))
 	require.NoError(t, registry.RegisterTarget(catalogDigestTarget("later", "https://later.example.test/oauth", "", nil, "")))
-	require.NoError(t, digestState.Capture(registry, controlPlane))
+	require.NoError(t, digestState.Capture(t.Context(), registry, controlPlane))
 
 	digest, ok := digestState.Result()
 	require.True(t, ok)
 	require.Equal(t, 1, digest.TargetCount)
 }
 
+func TestStartupCatalogDigestWithWorkloadIdentity(t *testing.T) {
+	t.Parallel()
+	registry := newCatalogDigestRegistry(t)
+	cfg := catalogDigestControlPlane("", "tunnel_0123456789abcdef0123456789abcdef")
+	token := "first.payload.signature"
+	cfg.TokenProvider = func(context.Context) (string, error) { return token, nil }
+
+	state := NewStartupCatalogDigestState()
+	require.NoError(t, state.Capture(t.Context(), registry, cfg))
+	before, ok := state.Result()
+	require.True(t, ok)
+	token = "second.payload.signature"
+	require.NoError(t, state.Capture(t.Context(), registry, cfg))
+	after, ok := state.Result()
+	require.True(t, ok)
+	require.Equal(t, before, after)
+}
+
 func TestStartupCatalogDigestReturnsGenericErrors(t *testing.T) {
 	t.Parallel()
 
 	registry := newCatalogDigestRegistry(t, catalogDigestTarget("private-label", "https://secret.example.test/private", "", nil, ""))
-	_, err := computeStartupCatalogDigest(registry, catalogDigestControlPlane("", "tunnel_0123456789abcdef0123456789abcdef"))
+	_, err := computeStartupCatalogDigest(t.Context(), registry, catalogDigestControlPlane("", "tunnel_0123456789abcdef0123456789abcdef"))
 	require.ErrorIs(t, err, errStartupCatalogDigestUnavailable)
 	require.NotContains(t, err.Error(), "private-label")
 	require.NotContains(t, err.Error(), "secret.example.test")
@@ -362,7 +380,7 @@ func catalogDigestTarget(label, rawURL, description string, tags []string, unixS
 
 func mustStartupCatalogDigest(t *testing.T, registry *Registry, runtimeKey, tunnelID string) startupCatalogDigest {
 	t.Helper()
-	digest, err := computeStartupCatalogDigest(registry, catalogDigestControlPlane(runtimeKey, tunnelID))
+	digest, err := computeStartupCatalogDigest(t.Context(), registry, catalogDigestControlPlane(runtimeKey, tunnelID))
 	require.NoError(t, err)
 	return digest
 }

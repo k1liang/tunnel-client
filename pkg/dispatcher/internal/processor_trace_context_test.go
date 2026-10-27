@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/controlplane"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
+	"github.com/openai/tunnel-client/pkg/tracing"
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
@@ -22,13 +24,14 @@ func TestProcessorTraceContextRequiresLocalOptIn(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name        string
-		optIn       *bool
-		kind        runtimeconfig.MCPTransportKind
-		legacy      bool
-		static      map[string]string
-		headers     http.Header
-		wantForward bool
+		name         string
+		optIn        *bool
+		kind         runtimeconfig.MCPTransportKind
+		legacy       bool
+		localTracing bool
+		static       map[string]string
+		headers      http.Header
+		wantForward  bool
 	}{
 		{name: "default_off", kind: runtimeconfig.MCPTransportHTTPStreamable},
 		{name: "explicit_false", optIn: new(false), kind: runtimeconfig.MCPTransportHTTPStreamable},
@@ -38,6 +41,9 @@ func TestProcessorTraceContextRequiresLocalOptIn(t *testing.T) {
 		{name: "in_memory", optIn: new(true), kind: runtimeconfig.MCPTransportInMemory},
 		{name: "static_parent", optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, static: map[string]string{"tRaCePaReNt": "customer"}},
 		{name: "static_empty_state", optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, static: map[string]string{"tracestate": ""}},
+		{name: "local_tracing_only", localTracing: true, kind: runtimeconfig.MCPTransportHTTPStreamable},
+		{name: "both_opt_ins_static_parent", localTracing: true, optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, static: map[string]string{"tRaCePaReNt": "customer"}},
+		{name: "both_opt_ins_static_empty_state", localTracing: true, optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, static: map[string]string{"tracestate": ""}},
 		{name: "polled_parent", optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, headers: http.Header{"traceparent": {"customer"}}},
 		{name: "polled_empty_state", optIn: new(true), kind: runtimeconfig.MCPTransportHTTPStreamable, headers: http.Header{"tRaCeStAtE": nil}},
 	} {
@@ -62,6 +68,14 @@ func TestProcessorTraceContextRequiresLocalOptIn(t *testing.T) {
 				cfg.ForwardTraceContext = *tc.optIn
 			}
 			responder := newRecordingResponder()
+			var localTracer *tracing.Runtime
+			if tc.localTracing {
+				var err error
+				localTracer, err = tracing.New(runtimeconfig.TracingConfig{Enabled: true, File: filepath.Join(t.TempDir(), "trace.jsonl")})
+				require.NoError(t, err)
+				require.True(t, localTracer.Enabled())
+				t.Cleanup(func() { require.NoError(t, localTracer.Shutdown(context.Background())) })
+			}
 			processor, err := NewProcessor(processorParams{
 				Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 				ChannelBindings: bindings,
@@ -70,6 +84,7 @@ func TestProcessorTraceContextRequiresLocalOptIn(t *testing.T) {
 				OAuthHTTPClient: &http.Client{},
 				ControlPlaneCfg: newTestControlPlaneConfig(t),
 				MeterProvider:   newTestMeterProvider(t),
+				Tracing:         localTracer,
 			})
 			require.NoError(t, err)
 			base := &fakePolledCommand{

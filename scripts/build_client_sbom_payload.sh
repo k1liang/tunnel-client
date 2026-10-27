@@ -55,6 +55,8 @@ Usage:
     --vendor-digest <declared-digest> \
     --vendor-archive <declared-archive> \
     --cloudflared-archive <declared-archive> \
+    --cloudflared-vendor-archive <declared-archive> \
+    --cloudflared-vendor-digest <declared-digest> \
     --expected-cloudflared-version <manifest-version> \
     --expected-cloudflared-module-path <manifest-module-path> \
     --expected-cloudflared-module-version <manifest-module-version> \
@@ -99,6 +101,8 @@ notice_file=""
 vendor_digest=""
 vendor_archive=""
 cloudflared_archive=""
+cloudflared_vendor_archive=""
+cloudflared_vendor_digest=""
 expected_cloudflared_version=""
 expected_cloudflared_module_path=""
 expected_cloudflared_module_version=""
@@ -143,6 +147,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cloudflared-archive)
       cloudflared_archive="${2:-}"
+      shift 2
+      ;;
+    --cloudflared-vendor-archive)
+      cloudflared_vendor_archive="${2:-}"
+      shift 2
+      ;;
+    --cloudflared-vendor-digest)
+      cloudflared_vendor_digest="${2:-}"
       shift 2
       ;;
     --expected-cloudflared-version)
@@ -212,8 +224,8 @@ if [[ "${component}" != "cloudflared" ]]; then
   input_files+=(go_mod go_sum license_file notice_file vendor_digest vendor_archive vendor_extractor_bin)
 fi
 if [[ "${component}" != "client" ]]; then
-  required_paths+=(cloudflared_archive cloudflared_extractor_bin)
-  input_files+=(cloudflared_archive cloudflared_extractor_bin)
+  required_paths+=(cloudflared_archive cloudflared_vendor_archive cloudflared_vendor_digest cloudflared_extractor_bin)
+  input_files+=(cloudflared_archive cloudflared_vendor_archive cloudflared_vendor_digest cloudflared_extractor_bin)
   if [[ "${component}" == "cloudflared" || -n "${cloudflared_manifest}" ]]; then
     required_paths+=(cloudflared_manifest)
     input_files+=(cloudflared_manifest)
@@ -289,6 +301,8 @@ if [[ "${component}" != "client" ]]; then
   cloudflared_source="$(
     "${python_bin}" "${cloudflared_extractor_bin}" \
       --archive "${cloudflared_archive}" \
+      --vendor-archive "${cloudflared_vendor_archive}" \
+      --vendor-digest "${cloudflared_vendor_digest}" \
       --output-root "${cloudflared_extract_root}"
   )"
 fi

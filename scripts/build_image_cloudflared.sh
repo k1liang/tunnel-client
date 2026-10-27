@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the image companion from the checksum-pinned, vendored source archive.
+# Build the image companion from the checksum-pinned source and vendor archives.
 # This is an action helper: every input path is passed by the declaring Bazel
 # rule, and no network or checkout fallback is allowed.
 
@@ -33,6 +33,8 @@ usage() {
 Usage:
   build_image_cloudflared.sh \
     --archive <declared-pinned-source-archive> \
+    --cloudflared-vendor-archive <declared-vendor-archive> \
+    --cloudflared-vendor-digest <declared-vendor-digest> \
     --manifest <declared-cloudflared-manifest> \
     --go <declared-go-tool> \
     --python <declared-python-tool> \
@@ -40,8 +42,8 @@ Usage:
     --goarch amd64|arm64 \
     --output <declared-output>
 
-Builds one Linux cloudflared binary from the pinned source archive's checked-
-in vendor tree. The action is offline, fixed-timestamp, and target-arch-only.
+Builds one Linux cloudflared binary from pinned source and reviewed vendor
+snapshots. The action is offline, fixed-timestamp, and target-arch-only.
 EOF
 }
 
@@ -62,6 +64,8 @@ clear_ambient_go_build_environment() {
 }
 
 archive=""
+cloudflared_vendor_archive=""
+cloudflared_vendor_digest=""
 manifest=""
 go_bin=""
 python_bin=""
@@ -72,6 +76,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --archive)
       archive="${2:-}"
+      shift 2
+      ;;
+    --cloudflared-vendor-archive)
+      cloudflared_vendor_archive="${2:-}"
+      shift 2
+      ;;
+    --cloudflared-vendor-digest)
+      cloudflared_vendor_digest="${2:-}"
       shift 2
       ;;
     --manifest)
@@ -109,7 +121,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for required_arg in archive manifest go_bin python_bin extractor output; do
+for required_arg in archive cloudflared_vendor_archive cloudflared_vendor_digest manifest go_bin python_bin extractor output; do
   [[ -n "${!required_arg}" ]] || die "--${required_arg//_/-} is required"
   printf -v "${required_arg}" '%s' "$(absolute_path "${!required_arg}")"
 done
@@ -119,6 +131,8 @@ case "${goarch}" in
 esac
 
 [[ -f "${archive}" ]] || die "declared source archive is missing: ${archive}"
+[[ -f "${cloudflared_vendor_archive}" ]] || die "declared vendor archive is missing: ${cloudflared_vendor_archive}"
+[[ -f "${cloudflared_vendor_digest}" ]] || die "declared vendor digest is missing: ${cloudflared_vendor_digest}"
 [[ -f "${manifest}" ]] || die "declared manifest is missing: ${manifest}"
 [[ -f "${extractor}" ]] || die "declared extractor is missing: ${extractor}"
 for executable in "${go_bin}" "${python_bin}"; do
@@ -138,6 +152,8 @@ export TEST_TMPDIR="${work_root}"
 source_root="$(
   "${python_bin}" "${extractor}" \
     --archive "${archive}" \
+    --vendor-archive "${cloudflared_vendor_archive}" \
+    --vendor-digest "${cloudflared_vendor_digest}" \
     --output-root "${work_root}/cloudflared-source"
 )" || die "could not extract the declared cloudflared source archive"
 [[ "${source_root}" == /* && -d "${source_root}" ]] ||

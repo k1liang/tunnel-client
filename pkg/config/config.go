@@ -27,6 +27,7 @@ type HarpoonTransportKind = runtimeconfig.HarpoonTransportKind
 type RuntimeConfig = runtimeconfig.RuntimeConfig
 type ControlPlaneConfig = runtimeconfig.ControlPlaneConfig
 type LoggingConfig = runtimeconfig.LoggingConfig
+type TracingConfig = runtimeconfig.TracingConfig
 type HealthConfig = runtimeconfig.HealthConfig
 type ProcessConfig = runtimeconfig.ProcessConfig
 type MCPConfig = runtimeconfig.MCPConfig
@@ -66,6 +67,7 @@ const (
 type Config struct {
 	ControlPlane ControlPlaneConfig
 	Logging      LoggingConfig
+	Tracing      TracingConfig
 	Health       HealthConfig
 	Process      ProcessConfig
 	Cloudflared  CloudflaredConfig
@@ -174,6 +176,7 @@ func fullConfigFromRuntime(
 	return &Config{
 		ControlPlane: core.ControlPlane,
 		Logging:      core.Logging,
+		Tracing:      core.Tracing,
 		Health:       core.Health,
 		Process:      core.Process,
 		Cloudflared:  cloudflared,
@@ -320,7 +323,8 @@ func WriteUsage(fs *pflag.FlagSet, w io.Writer) {
 	_, _ = fmt.Fprintln(fs.Output(), "  tunnel-client profiles samples list")
 	_, _ = fmt.Fprintln(fs.Output(), "  UI convention: http://<health.listen-addr>/ui")
 	_, _ = fmt.Fprintln(fs.Output(), "\nEnvironment variables:")
-	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_API_KEY\tAPI key used to authenticate to the tunnel control plane (required; preferred)")
+	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_API_KEY\tAPI key used to authenticate to the tunnel control plane (unless using AWS workload identity)")
+	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID, CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID\tOpenAI IDs for AWS workload identity")
 	_, _ = fmt.Fprintln(fs.Output(), "  OPENAI_API_KEY\tAPI key env var used when CONTROL_PLANE_API_KEY unset")
 	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_ORGANIZATION_ID\tOrganization ID sent as OpenAI-Organization on tunnel control-plane requests (optional)")
 	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_URL_PATH\tOptional URL path appended to CONTROL_PLANE_BASE_URL before tunnel-client adds its /v1/... routes")
@@ -346,6 +350,7 @@ func WriteUsage(fs *pflag.FlagSet, w io.Writer) {
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_EXTRA_HEADERS\tStatic headers for outbound MCP HTTP requests to the configured MCP server origin; values accept env:VAR or file:/path (optional)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_DISCOVERY_EXTRA_HEADERS\tStatic headers for MCP discovery/probe requests to the configured MCP server origin; values accept env:VAR or file:/path (optional)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_STARTUP_WAIT_TIMEOUT\tMaximum opt-in startup wait for the main MCP HTTP listener before first poll (optional)")
+	_, _ = fmt.Fprintln(fs.Output(), "  MCP_STDIO_FAILURE_POLICY\tRecovery after an unexpected stdio child loss: restart or exit (default: restart)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_STDIO_SEND_INITIALIZED_NOTIFICATION\tOpt in to sending notifications/initialized after a successful stdio initialize response (optional)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_FORWARD_TRACE_CONTEXT\tOpt in to forwarding traceparent/tracestate through MCP params._meta (default: false)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_CLIENT_CERT\tPath (or env:VAR) to PEM client certificate for MCP mTLS (optional)")

@@ -1212,6 +1212,27 @@ func TestLoadUsesControlPlaneAPIKeyFile(t *testing.T) {
 	}
 }
 
+func TestAWSWorkloadIdentityConfiguration(t *testing.T) {
+	env := map[string]string{"CONTROL_PLANE_TUNNEL_ID": envTunnelID, "MCP_SERVER_URL": "https://mcp.default", "CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID": "provider"}
+	load := func() error { _, err := LoadRuntimeForTest(nil, lookupEnvMap(env)); return err }
+	if load() == nil {
+		t.Fatal("accepted incomplete AWS identity")
+	}
+	env["CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID"] = "service-account"
+	if err := load(); err != nil {
+		t.Fatal(err)
+	}
+	env["CONTROL_PLANE_API_KEY"] = "static"
+	if load() == nil {
+		t.Fatal("accepted two credential sources")
+	}
+	delete(env, "CONTROL_PLANE_API_KEY")
+	env["CONTROL_PLANE_BASE_URL"] = "https://example.org"
+	if load() == nil {
+		t.Fatal("accepted nonproduction endpoint with AWS identity")
+	}
+}
+
 func TestLoadTrimsControlPlaneAPIKeyFileTrailingNewline(t *testing.T) {
 	t.Parallel()
 

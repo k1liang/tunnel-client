@@ -79,10 +79,7 @@ func CreateTemp(root *os.Root, pattern string) (*os.File, string, error) {
 	if strings.ContainsAny(pattern, `/\`) {
 		return nil, "", fmt.Errorf("temporary file pattern must not contain path separators")
 	}
-	prefix, suffix := pattern, ""
-	if index := strings.LastIndexByte(pattern, '*'); index >= 0 {
-		prefix, suffix = pattern[:index], pattern[index+1:]
-	}
+	prefix, suffix, _ := strings.CutLast(pattern, "*")
 	for range 10 {
 		name := prefix + rand.Text() + suffix
 		file, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
