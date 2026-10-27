@@ -101,7 +101,7 @@ func TestNewMcpClient_DefaultTransport(t *testing.T) {
 func TestNewMcpClientLegacyUnixSocket(t *testing.T) {
 	t.Parallel()
 
-	socketFile, err := os.CreateTemp("/tmp", "mcp-client-legacy-*.sock")
+	socketFile, err := os.CreateTemp(os.TempDir(), "mcp-client-legacy-*.sock")
 	if err != nil {
 		t.Fatalf("create unix socket temp file: %v", err)
 	}
